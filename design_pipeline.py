@@ -48,8 +48,18 @@ def workers_for(S, tool):
     """A 'worker' = one command + the GPU it runs on. Give a tool several workers (one per GPU) and the
     work is shared between them. Settings: "<tool>_workers": [{"cmd": [...], "env": {...}, "weight": 3}, ...]
     (weight = relative speed: a card twice as fast gets twice the work). Without it, one worker is built
-    from the older single-GPU keys "<tool>_cmd" / "<tool>_env"."""
-    return S.get(f"{tool}_workers") or [{"cmd": S[f"{tool}_cmd"], "env": S.get(f"{tool}_env"), "weight": 1}]
+    from the older single-GPU keys "<tool>_cmd" / "<tool>_env".
+    Add "copies": N to a worker to run N identical workers on the same GPU (their CPU-heavy parts overlap)."""
+    workers = S.get(f"{tool}_workers") or [{"cmd": S[f"{tool}_cmd"], "env": S.get(f"{tool}_env"), "weight": 1}]
+    expanded = []
+    for w in workers:
+        copies = int(w.get("copies", 1))
+        for _ in range(copies):
+            env = dict(w.get("env") or {})
+            if copies > 1:   # JAX normally grabs ~75% of GPU memory per process; share the card instead
+                env.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+            expanded.append({"cmd": w["cmd"], "env": env, "weight": w.get("weight", 1)})
+    return expanded
 
 
 def split_by_weight(items, workers):

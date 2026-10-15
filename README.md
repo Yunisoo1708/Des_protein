@@ -46,6 +46,12 @@ predictions took 51 min with 1 worker per card and **20.6 min with 4 workers on 
 (median), but 5 of 200 designs flipped pass/fail, mostly designs sitting right on the RMSD limit.
 `--output_dir` re-runs a stage into a different folder without touching earlier results.
 
+**How many workers per GPU?** Add `"copies": N` to a worker to run N identical workers on one card (JAX's
+memory grab is switched off automatically). The easy way is the `WORKERS_PER_GPU` block at the top of
+`settings_server_parallel.py` (two cards) or `settings_big_gpu.py` (one big card, e.g. L40S / H200; numbers can
+also be set per run, e.g. `AF2_WORKERS=16 python design_pipeline.py --settings settings_big_gpu.py ...`).
+The defaults for the big card are untested starting guesses: time 4, 8 and 16 AF2 workers and keep the fastest.
+
 ## Tips
 - Re-run one step only: `--stages score` (options: `rfd`, `mpnn`, `af3`, `score`).
 - No AF3 on your machine? Run steps `rfd,mpnn`, take the JSONs from `3_af3_inputs/` to another machine, copy the results back into `3_af3_outputs/`, then run `--stages score`.

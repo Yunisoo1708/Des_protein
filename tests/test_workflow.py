@@ -111,4 +111,25 @@ assert serial.keys() == parallel.keys() and all(
     serial[j][c] == parallel[j][c] for j in serial for c in ("pae_interaction", "plddt_binder", "rmsd_binder", "binder_seq")
 ), "parallel run must match the single-worker run"
 print("Test 6 passed: two workers share the work and give identical results")
+
+# ---- Test 7: "copies" (several workers on ONE GPU) ----------------------------------------------------------
+from design_pipeline import workers_for                          # noqa: E402
+w = workers_for({"x_workers": [{"cmd": ["a"], "env": {"CUDA_VISIBLE_DEVICES": "0"}, "weight": 2, "copies": 3}]}, "x")
+assert len(w) == 3 and all(x["weight"] == 2 and x["env"]["CUDA_VISIBLE_DEVICES"] == "0"
+                           and x["env"]["XLA_PYTHON_CLIENT_PREALLOCATE"] == "false" for x in w), "copies must expand to 3 workers"
+assert workers_for({"x_workers": [{"cmd": ["a"], "env": {}, "weight": 1}]}, "x")[0]["env"] == {}, "1 worker: env untouched"
+assert workers_for({"x_cmd": ["a"]}, "x")[0]["weight"] == 1, "old single-GPU keys still work"
+(work / "settings_copies.py").write_text(f"""
+import runpy
+S = runpy.run_path(r"{HERE / 'settings_test.py'}")["SETTINGS"]
+S.update(output_dir=r"{work / 'run_copies'}", af2_workers=[{{"cmd": S["af2_cmd"], "env": {{}}, "weight": 1, "copies": 3}}])
+SETTINGS = S
+""")
+cp = work / "run_copies"
+shutil.copytree(run, cp, ignore=shutil.ignore_patterns("3_af*", "results*.csv"))
+subprocess.run(base[:3] + [str(work / "settings_copies.py"), "--stages", "af2,score_af2"], check=True)
+assert sorted(p.name for p in (cp / "3_af2_outputs").iterdir()) == ["w0", "w1", "w2"], "3 copies -> 3 worker folders"
+same = {r["job"]: r for r in read_csv(cp / "results_af2.csv")}
+assert same.keys() == serial.keys() and all(same[j]["rmsd_binder"] == serial[j]["rmsd_binder"] for j in serial)
+print("Test 7 passed: 'copies' runs several workers on one GPU with the same results")
 print("\nALL TESTS PASSED")
