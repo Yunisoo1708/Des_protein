@@ -1,0 +1,5 @@
+RFdiffusion, 50 backbones, both GPUs: 1868 s
+ProteinMPNN, both GPUs:               154 s
+AF2 + scoring, 200 predictions:       3088 s
+TOTAL: 5110 s
+PAR_RUN_FINISHED
