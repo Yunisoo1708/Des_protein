@@ -6,7 +6,7 @@ from pathlib import Path
 
 # ---- EDIT THESE: number of worker processes per card, per tool --------------------------------------------------
 WORKERS_PER_GPU = {
-    "5060 Ti":    {"rfdiffusion": 1, "mpnn": 1, "af2": 4},
+    "5060 Ti":    {"rfdiffusion": 2, "mpnn": 1, "af2": 4},
     "1660 SUPER": {"rfdiffusion": 1, "mpnn": 1, "af2": 2},
 }
 # MEASURED on this machine (200 AF2 predictions): 1 worker/card 3088 s -> 4 + 2 workers 1237 s (2.5x faster).

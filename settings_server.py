@@ -26,7 +26,7 @@ SETTINGS = {
     "mpnn_cmd": [MPNN_PY, str(TOOLS / "ProteinMPNN/protein_mpnn_run.py")],
     "mpnn_env": {"CUDA_VISIBLE_DEVICES": "1"},            # light job -> old card
 
-    # Step 3, option A: AF2 "initial guess" (Bennett lab, dl_binder_design). "af2_bw" env = newer JAX for the new card.
+    # Step 3: AF2 "initial guess" (Bennett lab, dl_binder_design). "af2_bw" env = newer JAX for the new card.
     "af2_cmd": [str(ENVS / "af2_bw/bin/python"), str(TOOLS / "dl_binder_design/af2_initial_guess/predict.py")],
     # JAX recompiles for every new input length (slow, CPU-bound, GPU sits idle). The cache remembers compiled
     # programs between runs; also try a fixed binder_length (e.g. "55-55") so a batch compiles only once.
@@ -35,8 +35,6 @@ SETTINGS = {
                 "JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS": "0"},
     "af2_recycles": 3,
 
-    # Step 3, option B: no AF3 weights on this server -> use AlphaFold Server instead (afs_export / afs_import)
-    "af3_cmd": [], "af3_model_dir": "", "af3_use_msa": False, "af3_db_dir": "",
-
+    # What counts as a good design (rules of thumb). min_iptm is used only by the optional AlphaFold Server route.
     "min_iptm": 0.8, "min_plddt": 80, "max_rmsd": 2.0, "max_pae_interaction": 10,
 }

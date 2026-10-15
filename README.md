@@ -1,34 +1,35 @@
-# Binder design: RFdiffusion → ProteinMPNN → AlphaFold3
+# Binder design: RFdiffusion → ProteinMPNN → AlphaFold2 (Bennett "initial guess")
 
 ```
-target.pdb ─► [1 RFdiffusion] ─► backbones ─► [2 ProteinMPNN] ─► sequences ─► [3 AlphaFold3] ─► [4 Score] ─► results.csv
-              draw skeletons                  write sequences                 predict complex     iPTM, pLDDT, RMSD
+target.pdb ─► [1 RFdiffusion] ─► backbones ─► [2 ProteinMPNN] ─► sequences ─► [3 AF2 initial guess] ─► [4 Score] ─► results_af2.csv
+              draw skeletons                  write sequences                 predict binder+target    pAE_interaction, pLDDT, RMSD
 ```
+
+New here? Read [GUIDE.md](GUIDE.md): the run command, a map of the code, and a "how do I change X" cheat sheet.
 
 ## Use it
-1. Install the three tools (once). Pipeline itself needs only `pip install numpy biopython`.
+1. Install the tools (once): RFdiffusion, ProteinMPNN and [dl_binder_design](https://github.com/nrbennet/dl_binder_design) (needs PyRosetta and the public AF2 `params_model_1_ptm` weights). The pipeline script itself needs only `pip install numpy biopython`.
 2. Edit `settings.py` (target file, hotspots, tool paths).
 3. Run inside WSL/Linux: `python design_pipeline.py`
-4. Open `runs/run1/results.csv` (best iPTM first).
+4. Open `runs/run1/results_af2.csv` (best design first).
 
 ## Output columns
 | column | meaning | good |
 |---|---|---|
-| `iptm` | AF3 confidence in the binder–target interface (0–1) | > 0.8 |
-| `plddt_binder` | AF3 confidence in the binder's fold (0–100, mean over binder atoms) | > 80 |
-| `rmsd_binder` | Å between AF3 binder and the RFdiffusion/ProteinMPNN backbone, both complexes lined up on the target | < 2 |
+| `pae_interaction` | AF2's expected error in the binder's position relative to the target (lower is better) | < 10 |
+| `plddt_binder` | AF2 confidence in the binder's fold (0–100, mean over the binder) | > 80 |
+| `rmsd_binder` | Å between the AF2 binder and the RFdiffusion/ProteinMPNN backbone, both complexes lined up on the target | < 2 |
 
-`rmsd_binder` is the "does AF3 agree with what I designed?" check. ProteinMPNN only writes sequences, so its "structure" is the RFdiffusion backbone it was given.
+`rmsd_binder` is the "does AF2 agree with what I designed?" check. ProteinMPNN only writes sequences, so its "structure" is the RFdiffusion backbone it was given. The AF2 model has **no iPTM**; for that, use the optional AlphaFold Server route below.
 
 ## Folders it creates
-`1_rfdiffusion/` backbones · `2_mpnn/` sequences (`sequences.csv`) · `3_af3_inputs/` · `3_af3_outputs/` · `results.csv`
+`1_rfdiffusion/` backbones · `2_mpnn/` sequences (`sequences.csv`) · `3_af2_inputs/` · `3_af2_outputs/` (one `w0`, `w1`… folder per worker) · `results_af2.csv`
 
-## Three ways to do step 3 (checking the designs)
-| Route | Stages | Gives | Needs |
-|---|---|---|---|
-| AlphaFold3 (local) | `af3,score` | iPTM, pLDDT, RMSD | AF3 weights from Google DeepMind |
-| AlphaFold Server (website) | `afs_export`, then `afs_import,score` | iPTM, pLDDT, RMSD | a Google login; upload `afserver_jobs.json` by hand |
-| AF2 "initial guess" (Bennett lab) | `af2,score_af2` | pAE_interaction (instead of iPTM), pLDDT, RMSD | PyRosetta + AF2 weights (public) |
+## Optional: iPTM from AlphaFold Server (website)
+The only route that gives iPTM, and it needs nothing installed:
+1. `--stages rfd,mpnn,afs_export` writes `afserver_jobs.json`.
+2. Upload it at alphafoldserver.com (Upload JSON; needs a Google login; the site has a daily job limit, so send only your best designs) and download the result `.zip` files into one folder.
+3. `--stages afs_import,score_afs --afserver_zips <that folder>` gives `results_afserver.csv` with `iptm`, `plddt_binder`, `rmsd_binder`.
 
 ## GPU server notes (`settings_server.py`, `settings_server_large.py`)
 - RTX 5060 Ti (new) runs RFdiffusion and AF2; GTX 1660 SUPER (old) can run ProteinMPNN. Pick a card per tool with `*_env: {"CUDA_VISIBLE_DEVICES": "0"}`.
@@ -53,10 +54,9 @@ also be set per run, e.g. `AF2_WORKERS=16 python design_pipeline.py --settings s
 The defaults for the big card are untested starting guesses: time 4, 8 and 16 AF2 workers and keep the fastest.
 
 ## Tips
-- Re-run one step only: `--stages score` (options: `rfd`, `mpnn`, `af3`, `score`).
-- No AF3 on your machine? Run steps `rfd,mpnn`, take the JSONs from `3_af3_inputs/` to another machine, copy the results back into `3_af3_outputs/`, then run `--stages score`.
-- AF3 needs a big GPU (≥16 GB is the practical minimum; this laptop has 8 GB) and weights requested from Google DeepMind. Without MSA databases keep `af3_use_msa: False`.
+- Re-run one step only: `--stages score_af2` (options: `rfd`, `mpnn`, `af2`, `score_af2`). Re-scoring needs no GPU, so you can try new pass limits in seconds.
+- Use a new `output_dir` for every run; old files in a reused folder get mixed into the new results.
 - Start small (`num_backbones: 10`) and look at the table before scaling up.
 
 ## Test it (no GPU, no tools needed)
-`python tests/test_workflow.py` runs the whole pipeline with fake tools (`tests/fake_tools.py`) that copy the real tools' command lines and output formats. It checks the commands, file parsing, and the iPTM/pLDDT/RMSD maths. It does **not** judge design quality.
+`python tests/test_workflow.py` runs the whole pipeline with fake tools (`tests/fake_tools.py`) that copy the real tools' command lines and output formats. It checks the commands, file parsing, the multi-worker splitting and the pAE/iPTM/pLDDT/RMSD maths. It does **not** judge design quality.

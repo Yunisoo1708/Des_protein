@@ -1,16 +1,18 @@
 """
-FAKE versions of RFdiffusion, ProteinMPNN and AlphaFold3, used only to test the pipeline.
+FAKE versions of RFdiffusion, ProteinMPNN, the AF2 predictor and the AlphaFold Server website, used only to
+test the pipeline.
 
 They copy the real tools' command-line options and output file names/formats, but the "designs" are
 random helices and the "predictions" are the input backbone plus known noise. So this tests the
-plumbing (commands, file parsing, iPTM / pLDDT / RMSD maths), NOT design quality.
+plumbing (commands, file parsing, pAE / iPTM / pLDDT / RMSD maths), NOT design quality.
 
-Usage:  python fake_tools.py rfdiffusion|mpnn|af3  <the same arguments the real tool takes>
+Usage:  python fake_tools.py rfdiffusion|mpnn|af2|afserver  <the same arguments the real tool takes>
 """
 import argparse
 import json
 import re
 import sys
+import zipfile
 import zlib
 from pathlib import Path
 
@@ -87,7 +89,7 @@ def mpnn(args):
     (Path(a.out_folder) / "seqs" / f"{name}.fa").write_text("\n".join(out) + "\n")
 
 
-# ---------------------------------------------------------------- AlphaFold3
+# ---------------------------------------------------------------- AlphaFold Server (the website)
 def write_cif(path, name, chains):
     head = ["data_" + name, "loop_"] + ["_atom_site." + c for c in
             "group_PDB id type_symbol label_atom_id label_alt_id label_comp_id label_asym_id label_entity_id "
@@ -101,17 +103,18 @@ def write_cif(path, name, chains):
     Path(path).write_text("\n".join(head + rows) + "\n#\n")
 
 
-def af3(args):
+def afserver(args):
+    """Pretend to be the alphafoldserver.com website: read the exported afserver_jobs.json and write one
+    fold_<name>.zip per job, named and filled the way the website does it."""
     p = argparse.ArgumentParser()
-    for flag in ["--input_dir", "--json_path", "--output_dir", "--model_dir", "--db_dir"]:
+    for flag in ["--jobs", "--run_dir", "--out_zips"]:
         p.add_argument(flag)
     a, _ = p.parse_known_args(args)
-    files = sorted(Path(a.input_dir).glob("*.json")) if a.input_dir else [Path(a.json_path)]
-    for f in files:
-        job = json.loads(f.read_text())
+    for job in json.loads(Path(a.jobs).read_text()):
         name = job["name"]
-        seqs = {s["protein"]["id"]: s["protein"]["sequence"] for s in job["sequences"]}
-        backbone = read_pdb(Path(a.output_dir).parent / "1_rfdiffusion" / (name.rsplit("_s", 1)[0] + ".pdb"))
+        seqs = {"A": job["sequences"][0]["proteinChain"]["sequence"],      # binder = chain A
+                "B": job["sequences"][1]["proteinChain"]["sequence"]}      # target = chain B
+        backbone = read_pdb(Path(a.run_dir) / "1_rfdiffusion" / (name.rsplit("_s", 1)[0] + ".pdb"))
         rng = np.random.default_rng(zlib.crc32(name.encode()))
         sigma = float(rng.uniform(0.1, 3.0))                       # how wrong this "prediction" is (Å per axis)
         gly = {c: np.mean([r == "GLY" for r, _ in res]) for c, res in backbone.items()}
@@ -120,13 +123,13 @@ def af3(args):
         noise = rng.normal(0, sigma, (len(seqs["A"]), 3))
         binder = np.array([x for _, x in backbone[b_src]]) + noise
         target = np.array([x for _, x in backbone[t_src]])
-        # AF3 models come out in an arbitrary position/orientation -> rotate + shift everything
+        # predicted models come out in an arbitrary position/orientation -> rotate + shift everything
         q, _ = np.linalg.qr(rng.normal(size=(3, 3)))
         q *= np.sign(np.linalg.det(q))
         shift = rng.normal(0, 20, 3)
         model = {"A": [(seq3(a_).upper(), x) for a_, x in zip(seqs["A"], binder @ q + shift)],
                  "B": [(seq3(a_).upper(), x) for a_, x in zip(seqs["B"], target @ q + shift)]}
-        d = Path(a.output_dir) / name
+        d = Path(a.out_zips) / "_tmp" / name
         d.mkdir(parents=True, exist_ok=True)
         write_cif(d / f"{name}_model.cif", name, model)
         iptm = float(np.clip(0.95 - 0.12 * sigma + rng.normal(0, 0.03), 0, 1))
@@ -136,7 +139,12 @@ def af3(args):
         plddt = np.clip(np.concatenate([rng.normal(92 - 8 * sigma, 2, n_a), rng.normal(90, 2, n_b)]), 0, 100)
         (d / f"{name}_confidences.json").write_text(json.dumps(
             {"atom_chain_ids": ["A"] * n_a + ["B"] * n_b, "atom_plddts": plddt.tolist()}))
-        (d / "fake_truth.json").write_text(json.dumps({"expected_rmsd_binder": float(np.sqrt((noise ** 2).sum(axis=1).mean()))}))
+        (Path(a.out_zips) / f"{name}_truth.json").write_text(json.dumps(
+            {"expected_rmsd_binder": float(np.sqrt((noise ** 2).sum(axis=1).mean()))}))
+        with zipfile.ZipFile(Path(a.out_zips) / f"fold_{name}.zip", "w") as z:   # the website returns 5 models; we write model 0
+            z.write(d / f"{name}_model.cif", f"fold_{name}_model_0.cif")
+            z.write(d / f"{name}_summary_confidences.json", f"fold_{name}_summary_confidences_0.json")
+            z.write(d / f"{name}_confidences.json", f"fold_{name}_full_data_0.json")
 
 
 # ---------------------------------------------------------------- AF2 initial guess (dl_binder_design predict.py)
@@ -162,4 +170,4 @@ def af2(args):
 
 
 if __name__ == "__main__":
-    {"rfdiffusion": rfdiffusion, "mpnn": mpnn, "af3": af3, "af2": af2}[sys.argv[1]](sys.argv[2:])
+    {"rfdiffusion": rfdiffusion, "mpnn": mpnn, "afserver": afserver, "af2": af2}[sys.argv[1]](sys.argv[2:])

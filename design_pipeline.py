@@ -1,22 +1,27 @@
 """
-Protein binder design pipeline:   RFdiffusion  ->  ProteinMPNN  ->  AlphaFold3
+Protein binder design pipeline:   RFdiffusion  ->  ProteinMPNN  ->  AlphaFold2 "initial guess" (Bennett lab)
 
 What each tool does (one line each):
   1. RFdiffusion : draws NEW protein backbones (just the "skeleton", no sequence) that stick to your target.
   2. ProteinMPNN : writes amino-acid sequences that should fold into each skeleton.
-  3. AlphaFold3  : predicts the structure of (binder + target) from each sequence, to check the design.
+  3. AF2 (dl_binder_design, Bennett et al.) : predicts the structure of (binder + target) from each sequence,
+                   starting from the designed backbone, to check that the design is self-consistent.
 
-Final table (results.csv) has, for every designed sequence:
-  iptm           0-1    how sure AF3 is that binder and target touch correctly.  Higher = better (>0.8 is good)
-  plddt_binder   0-100  how sure AF3 is about the binder's own fold.             Higher = better (>80 is good)
-  rmsd_binder    in Å   how far AF3's binder is from the RFdiffusion/ProteinMPNN backbone, after
-                        lining up the two complexes on the target.                Lower = better (<2 is good)
+Final table (results_af2.csv) has, for every designed sequence:
+  pae_interaction  how sure AF2 is about the binder's position relative to the target.  Lower = better (<10 is good)
+  plddt_binder     0-100  how sure AF2 is about the binder's own fold.                  Higher = better (>80 is good)
+  rmsd_binder      in A   how far AF2's binder is from the RFdiffusion/ProteinMPNN backbone, after
+                          lining up the two complexes on the target.                    Lower = better (<2 is good)
 
-How to run (inside WSL / Linux, where the three tools live):
+AF2 has no iPTM. If you want one, the optional AlphaFold Server route (alphafoldserver.com, a website) gives
+iPTM, pLDDT and RMSD: see --stages afs_export / afs_import / score_afs below.
+
+How to run (inside WSL / Linux, where the tools live):
   python design_pipeline.py                         # all four steps, uses settings.py
   python design_pipeline.py --settings my_set.py    # use another settings file
-  python design_pipeline.py --stages score          # re-run only some steps (rfd, mpnn, af3, score)
-  python design_pipeline.py --stages rfd,mpnn,af2,score_af2   # use the AF2 (Bennett) checker instead of AF3
+  python design_pipeline.py --stages score_af2      # re-run only some steps (rfd, mpnn, af2, score_af2)
+  python design_pipeline.py --stages rfd,mpnn,afs_export   # then upload afserver_jobs.json to alphafoldserver.com
+  python design_pipeline.py --stages afs_import,score_afs --afserver_zips <folder of downloaded zips>
 """
 import argparse
 import csv
@@ -206,45 +211,18 @@ def step2_mpnn(S, backbones, out):
 
 
 # ----------------------------------------------------------------------------
-# Step 3: AlphaFold3  (predict binder + target together)
+# Step 3 (optional route): AlphaFold SERVER (alphafoldserver.com, a website; nothing to install)
+#   afs_export : writes afserver_jobs.json  -> you upload it on the website (Upload JSON)
+#   afs_import : reads the .zip files you download from the website, puts them where "score_afs" expects them
+# The only route that gives iPTM. The site has a daily job limit, so send it only your best designs.
 # ----------------------------------------------------------------------------
-def af3_input(job, use_msa):
-    """AF3 reads a small JSON file per job. The binder is always chain A, target chain B."""
-    def protein(chain_id, seq):
-        p = {"id": chain_id, "sequence": seq}
-        if not use_msa:  # "single-sequence mode": skip the slow database search
-            p.update(unpairedMsa=f">query\n{seq}\n", pairedMsa=f">query\n{seq}\n", templates=[])
-        return {"protein": p}
-    return {"name": job["job"], "modelSeeds": [1], "dialect": "alphafold3", "version": 1,
-            "sequences": [protein("A", job["binder_seq"]), protein("B", job["target_seq"])]}
-
-
-def af3_files(out, name):
-    """Where AF3 puts its answers for one job."""
-    d = out / "3_af3_outputs" / name
+def afs_files(out, name):
+    """Where the imported AlphaFold Server results for one job are kept."""
+    d = out / "3_afserver_outputs" / name
     return d / f"{name}_model.cif", d / f"{name}_summary_confidences.json", d / f"{name}_confidences.json"
 
 
-def step3_af3(S, jobs, out):
-    in_dir = out / "3_af3_inputs"
-    in_dir.mkdir(parents=True, exist_ok=True)
-    for job in jobs:
-        (in_dir / f"{job['job']}.json").write_text(json.dumps(af3_input(job, S["af3_use_msa"]), indent=1))
-    # NOTE: if a previous AF3 run was cut short, delete 3_af3_outputs before re-running.
-    if all(af3_files(out, j["job"])[1].exists() for j in jobs):
-        print("  -> AF3 results already exist, skipping")
-        return
-    cmd = S["af3_cmd"] + [f"--input_dir={in_dir}", f"--output_dir={out / '3_af3_outputs'}",
-                          f"--model_dir={S['af3_model_dir']}"]
-    cmd += [f"--db_dir={S['af3_db_dir']}"] if S["af3_use_msa"] else ["--norun_data_pipeline"]
-    run(cmd, env=S.get("af3_env"))
 
-
-# ----------------------------------------------------------------------------
-# Step 3 (alternative): AlphaFold SERVER (alphafoldserver.com, website, no AF3 install needed)
-#   afs_export : writes afserver_jobs.json  -> you upload it on the website (Upload JSON)
-#   afs_import : reads the .zip files you download from the website, puts them where "score" expects them
-# ----------------------------------------------------------------------------
 def step3_afserver_export(jobs, out):
     payload = [{"name": j["job"], "modelSeeds": [], "dialect": "alphafoldserver", "version": 1,
                 "sequences": [{"proteinChain": {"sequence": j["binder_seq"], "count": 1}},    # binder = chain A
@@ -266,19 +244,19 @@ def step3_afserver_import(zip_folder, jobs, out):
         if not zips:
             print(f"  ! no zip found for {name} (expected fold_{name}.zip), skipped")
             continue
-        dest = af3_files(out, name)[0].parent
+        dest = afs_files(out, name)[0].parent
         dest.mkdir(parents=True, exist_ok=True)
         with zipfile.ZipFile(zips[0]) as z:   # model_0 = the best of the 5 models the server returns
             (dest / f"{name}_model.cif").write_bytes(z.read(f"fold_{name}_model_0.cif"))
             (dest / f"{name}_summary_confidences.json").write_bytes(z.read(f"fold_{name}_summary_confidences_0.json"))
             (dest / f"{name}_confidences.json").write_bytes(z.read(f"fold_{name}_full_data_0.json"))
-    print("  -> imported. Now run:  --stages score")
+    print("  -> imported. Now run:  --stages score_afs")
 
 
 # ----------------------------------------------------------------------------
-# Step 3 (alternative): AlphaFold2 "initial guess" from Bennett et al. (github.com/nrbennet/dl_binder_design)
-#   Needs no AF3 weights. It reports pae_interaction (lower = better; the score the paper found most
-#   predictive) instead of iPTM, because it uses the AF2 monomer model.
+# Step 3 (main route): AlphaFold2 "initial guess" from Bennett et al. (github.com/nrbennet/dl_binder_design)
+#   It reports pae_interaction (lower = better; the score the paper found most predictive) instead of
+#   iPTM, because it uses the AF2 monomer model.
 # ----------------------------------------------------------------------------
 THREE = {"A": "ALA", "R": "ARG", "N": "ASN", "D": "ASP", "C": "CYS", "Q": "GLN", "E": "GLU", "G": "GLY", "H": "HIS",
          "I": "ILE", "L": "LEU", "K": "LYS", "M": "MET", "F": "PHE", "P": "PRO", "S": "SER", "T": "THR", "W": "TRP",
@@ -354,29 +332,30 @@ def rmsd(a, b):
     return float(np.sqrt(((a - b) ** 2).sum(axis=1).mean()))
 
 
-def score_job(job, out):
-    cif, summary_file, conf_file = af3_files(out, job["job"])
+def score_job_afs(job, out):
+    """Score one design from its imported AlphaFold Server result (iPTM, pLDDT, RMSD)."""
+    cif, summary_file, conf_file = afs_files(out, job["job"])
     summary = json.loads(summary_file.read_text())
     conf = json.loads(conf_file.read_text())
 
-    # --- iPTM: straight from AF3's summary file ---
+    # --- iPTM: straight from the server's summary file ---
     iptm = summary["iptm"]
 
-    # --- pLDDT: AF3 gives one value per atom; average over the binder's atoms (chain A) ---
+    # --- pLDDT: one value per atom; average over the binder's atoms (chain A) ---
     plddt = np.array(conf["atom_plddts"])
     is_binder = np.array(conf["atom_chain_ids"]) == "A"
 
-    # --- RMSD: AF3 model vs the backbone that went into ProteinMPNN ---
+    # --- RMSD: predicted model vs the backbone that went into ProteinMPNN ---
     ref = read_chains(job["backbone"])                      # RFdiffusion / ProteinMPNN backbone
-    af3 = read_chains(cif)                                  # AF3 prediction (binder = A, target = B)
+    pred = read_chains(cif)                                 # prediction (binder = A, target = B)
     ref_binder = np.array([xyz for _, xyz in ref[job["binder_chain"]]])
     ref_target = np.array([xyz for _, xyz in ref[job["target_chain"]]])
-    af3_binder = np.array([xyz for _, xyz in af3["A"]])
-    af3_target = np.array([xyz for _, xyz in af3["B"]])
-    if af3_binder.shape != ref_binder.shape or af3_target.shape != ref_target.shape:
-        raise ValueError(f"{job['job']}: AF3 and backbone have different residue counts")
-    move = make_fitter(af3_target, ref_target)              # 1) line up the TARGETS
-    rmsd_binder = rmsd(move(af3_binder), ref_binder)        # 2) then measure how far the BINDER moved
+    pred_binder = np.array([xyz for _, xyz in pred["A"]])
+    pred_target = np.array([xyz for _, xyz in pred["B"]])
+    if pred_binder.shape != ref_binder.shape or pred_target.shape != ref_target.shape:
+        raise ValueError(f"{job['job']}: prediction and backbone have different residue counts")
+    move = make_fitter(pred_target, ref_target)             # 1) line up the TARGETS
+    rmsd_binder = rmsd(move(pred_binder), ref_binder)       # 2) then measure how far the BINDER moved
 
     return {"job": job["job"], "iptm": round(iptm, 3),
             "plddt_binder": round(float(plddt[is_binder].mean()), 1),
@@ -385,21 +364,23 @@ def score_job(job, out):
             "mpnn_score": job["mpnn_score"], "binder_seq": job["binder_seq"]}
 
 
-def step4_score(S, jobs, out):
-    rows = [score_job(j, out) for j in jobs]
-    for r in rows:  # rule-of-thumb pass mark; change the limits in settings.py
-        ok = r["iptm"] >= S["min_iptm"] and r["plddt_binder"] >= S["min_plddt"] and r["rmsd_binder"] <= S["max_rmsd"]
+def step4_score_afs(S, jobs, out):
+    # only score the jobs whose results were imported (a daily limit means you may send just a few)
+    jobs = [j for j in jobs if afs_files(out, j["job"])[1].exists()]
+    rows = [score_job_afs(j, out) for j in jobs]
+    for r in rows:  # rule-of-thumb pass mark; change the limits in the settings file
+        ok = r["iptm"] >= S.get("min_iptm", 0.8) and r["plddt_binder"] >= S["min_plddt"] and r["rmsd_binder"] <= S["max_rmsd"]
         r["pass"] = "PASS" if ok else "fail"
     rows.sort(key=lambda r: r["iptm"], reverse=True)   # best first
-    write_csv(out / "results.csv", rows)
+    write_csv(out / "results_afserver.csv", rows)
     print(f"\n{'job':<16}{'iptm':>6}{'plddt_binder':>14}{'rmsd_binder':>13}  verdict")
     for r in rows:
         print(f"{r['job']:<16}{r['iptm']:>6}{r['plddt_binder']:>14}{r['rmsd_binder']:>13}  {r['pass']}")
-    print(f"\nSaved: {out / 'results.csv'}   ({sum(r['pass'] == 'PASS' for r in rows)}/{len(rows)} pass)")
+    print(f"\nSaved: {out / 'results_afserver.csv'}   ({sum(r['pass'] == 'PASS' for r in rows)}/{len(rows)} pass)")
 
 
 def score_job_af2(job, out, af2_scores):
-    """Same three ideas as score_job, but from the AF2 'initial guess' outputs."""
+    """Pass/fail ideas as in score_job_afs, but from the AF2 'initial guess' outputs."""
     sc = af2_scores[f"{job['job']}_af2pred"]
     ref = read_chains(job["backbone"])
     pred_file = next((out / "3_af2_outputs").glob(f"w*/{job['job']}_af2pred.pdb"))      # whichever GPU made it
@@ -445,10 +426,10 @@ def read_csv(path):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="RFdiffusion -> ProteinMPNN -> AlphaFold3 binder design")
+    ap = argparse.ArgumentParser(description="RFdiffusion -> ProteinMPNN -> AlphaFold2 (Bennett initial guess) binder design")
     ap.add_argument("--settings", default=str(Path(__file__).with_name("settings.py")))
-    ap.add_argument("--stages", default="rfd,mpnn,af3,score",
-                    help="comma list of: rfd,mpnn,af3,score  |  af2,score_af2 (AF2 initial guess)  |  afs_export,afs_import (AlphaFold Server)")
+    ap.add_argument("--stages", default="rfd,mpnn,af2,score_af2",
+                    help="comma list of: rfd,mpnn,af2,score_af2  |  optional AlphaFold Server route: afs_export,afs_import,score_afs")
     ap.add_argument("--afserver_zips", help="folder with fold_*.zip downloaded from alphafoldserver.com")
     ap.add_argument("--output_dir", help="use this folder instead of the one in the settings file")
     args = ap.parse_args()
@@ -464,25 +445,22 @@ def main():
     if "mpnn" in stages:
         print("\n[2/4] ProteinMPNN: designing sequences")
         step2_mpnn(S, sorted((out / "1_rfdiffusion").glob("design_*.pdb")), out)
-    jobs = read_csv(out / "2_mpnn" / "sequences.csv") if {"af3", "af2", "score", "score_af2", "afs_export", "afs_import"} & set(stages) else []
+    jobs = read_csv(out / "2_mpnn" / "sequences.csv") if {"af2", "score_af2", "afs_export", "afs_import", "score_afs"} & set(stages) else []
     if "afs_export" in stages:
         print("\n[3/4] AlphaFold Server: export jobs")
         step3_afserver_export(jobs, out)
     if "afs_import" in stages:
         print("\n[3/4] AlphaFold Server: import results")
         step3_afserver_import(args.afserver_zips, jobs, out)
-    if "af3" in stages:
-        print("\n[3/4] AlphaFold3: predicting binder + target")
-        step3_af3(S, jobs, out)
     if "af2" in stages:
         print("\n[3/4] AlphaFold2 initial guess (Bennett): predicting binder + target")
         step3_af2(S, jobs, out)
-    if "score" in stages:
-        print("\n[4/4] Scoring")
-        step4_score(S, jobs, out)
     if "score_af2" in stages:
         print("\n[4/4] Scoring (AF2 initial guess)")
         step4_score_af2(S, jobs, out)
+    if "score_afs" in stages:
+        print("\n[4/4] Scoring (AlphaFold Server results)")
+        step4_score_afs(S, jobs, out)
 
 
 if __name__ == "__main__":
