@@ -106,6 +106,7 @@ Open `main()` first: it is the table of contents and runs the stages in order. T
 | designs RFD3 makes at once | settings: `rfd3_batch_size` (2 was ~1.8x faster on a 6 GB card, using 5 GB) |
 | use RFD4-Proteina instead of RFD3 | `BACKBONE_TOOL=rfd4` (settings: `backbone_tool: "rfd4"`, `rfd4_cmd`/`rfd4_workers`); install with `bash install_envs.sh rfd4_env`; see the README section |
 | designs RFD4 makes at once / ProteinMPNN on top of RFD4 | settings: `rfd4_batch_size` (`RFD4_BATCH`), `rfd4_mpnn` (`RFD4_MPNN=1`) |
+| use both GPUs of the two-card server | `--settings settings_dual_gpu.py` (per-card workers `RFD_WORKERS_0/_1`, `AF2_WORKERS_0/_1`; a worker can have its own `"batch"`); worth it for big AF2 batches only, see the README |
 | AF2 on an RTX 50xx card | `AF2_ENV=af2_bw` (settings_big_gpu.py); the default `af2_bd` cannot compile for Blackwell |
 | more varied sequences | the `"--sampling_temp", "0.1"` line in `design_sequences` (try 0.2-0.3) |
 | ranking of the table | the `rows.sort(...)` lines in `step4_score_af2` / `step4_score_afs` |

@@ -269,12 +269,17 @@ import runpy
 S = runpy.run_path(r"{work / 'settings_rfd4.py'}")["SETTINGS"]
 S.update(output_dir=r"{work / 'run_rfd4_par'}", num_backbones=5)
 S["rfd4_workers"] = [{{"cmd": S["rfd4_cmd"], "env": {{"WORKER": "0"}}, "weight": 2}},
-                     {{"cmd": S["rfd4_cmd"], "env": {{"WORKER": "1"}}, "weight": 1}}]
+                     {{"cmd": S["rfd4_cmd"] + ["precision=32-true", "inference_experiment=quickstart"], "env": {{"WORKER": "1"}},
+                      "weight": 1, "batch": 1}}]          # a small card: its own batch size and extra RFD4 arguments
 SETTINGS = S
 """)
 pipeline(work / "settings_rfd4_par.py", "--stages", "rfd")
 made4 = sorted((work / "run_rfd4_par" / "1_rfdiffusion").glob("design_*.pdb"))
 assert len(made4) == 5 and len({p.read_text() for p in made4}) == 5, "5 distinct RFD4 designs expected from 2 workers"
+a0 = (work / "run_rfd4_par" / "1_rfd4_raw" / "w0" / "args.txt").read_text().splitlines()
+a1 = (work / "run_rfd4_par" / "1_rfd4_raw" / "w1" / "args.txt").read_text().splitlines()
+assert "batch_size=2" in a0 and "~metrics" in a0 and "batch_size=1" in a1 and "precision=32-true" in a1, (a0, a1)
+assert "~metrics" not in a1 and "seed=1" in a0 and "seed=1001" in a1, "per-worker batch, extra arguments and seeds"
 
 # optional: redesign the sequences with ProteinMPNN anyway
 (work / "settings_rfd4_mpnn.py").write_text(f"""
@@ -300,4 +305,35 @@ SETTINGS = S
                          capture_output=True, text=True)
     assert res.returncode != 0 and words in (res.stdout + res.stderr), (bad, res.stdout[-300:], res.stderr[-300:])
 print("Test 11 passed: RFD4 route (CIF with one chain per piece, spec, original numbering, native sequences, per-worker seeds)")
+
+# ---- Test 12: settings_dual_gpu.py builds the right workers for the two-card server -------------------------------------------
+import os                                                                      # noqa: E402
+import runpy                                                                   # noqa: E402
+from design_pipeline import split_by_weight                                    # noqa: E402
+env12 = {"TARGET_PDB": "t.pdb", "TARGET_RANGE": "A1-10", "HOTSPOTS": "A5", "NUM_BACKBONES": "24"}
+saved = {k: os.environ.get(k) for k in [*env12, "BACKBONE_TOOL", "RFD_WORKERS_1"]}
+try:
+    os.environ.update(env12)
+    for tool_name, expect_cards in (("rfd4", ["0"]), ("rfd3", ["0", "1"])):          # RFD4 leaves the 1660 SUPER out by default
+        os.environ["BACKBONE_TOOL"] = tool_name
+        S12 = runpy.run_path(str(HERE.parent / "settings_dual_gpu.py"))["SETTINGS"]
+        bb = workers_for(S12, f"{tool_name}_workers".replace("_workers", ""))
+        assert [w["env"]["CUDA_VISIBLE_DEVICES"] for w in bb] == expect_cards, (tool_name, bb)
+    os.environ.update(BACKBONE_TOOL="rfd4", RFD_WORKERS_1="1")                       # ... and a user can switch it on
+    S12 = runpy.run_path(str(HERE.parent / "settings_dual_gpu.py"))["SETTINGS"]
+    bb = workers_for(S12, "rfd4")
+    assert [len(c) for c in split_by_weight(range(24), bb)] == [22, 2], "12 : 1 share of 24 designs"
+    assert bb[1]["batch"] == 2 and "precision=32-true" in bb[1]["cmd"] and "inference_experiment=quickstart" in bb[1]["cmd"]
+    assert bb[0]["batch"] == 8 and bb[0]["cmd"][0].endswith("rfd4-generate") and bb[0]["env"]["CUDA_VISIBLE_DEVICES"] == "0"
+    split24 = [len(c) for c in split_by_weight(range(24), [{"weight": 1}] * 6 + [{"weight": 0.7}] * 2)]
+    assert sum(split24) == 24 and max(split24[:6]) <= 4 and max(split24[6:]) <= 3, split24      # no leftover dumped on the last worker
+    assert sorted(len(c) for c in split_by_weight(range(7), [{"weight": 1}] * 3)) == [2, 2, 3]
+    af = workers_for(S12, "af2")
+    assert [w["env"]["CUDA_VISIBLE_DEVICES"] for w in af] == ["0"] * 4 + ["1"] * 2
+    assert "af2_bw" in af[0]["cmd"][0] and "af2_bd" in af[-1]["cmd"][0], "Blackwell card needs the newer-JAX environment"
+    assert all(w["env"]["XLA_PYTHON_CLIENT_PREALLOCATE"] == "false" for w in af)
+finally:
+    for k, v in saved.items():
+        os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+print("Test 12 passed: dual-GPU settings (RFD4 on the big card only, RFD3 on both, AF2 environment per card, 12:1 / 4:1 shares)")
 print("\nALL TESTS PASSED")

@@ -68,17 +68,22 @@ def workers_for(S, tool):
             env = dict(w.get("env") or {})
             if copies > 1:   # JAX normally grabs ~75% of GPU memory per process; share the card instead
                 env.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
-            expanded.append({"cmd": w["cmd"], "env": env, "weight": w.get("weight", 1)})
+            expanded.append({"cmd": w["cmd"], "env": env, "weight": w.get("weight", 1),
+                             "batch": w.get("batch")})            # optional: designs this worker makes at once (RFD3 / RFD4)
     return expanded
 
 
 def split_by_weight(items, workers):
     """Cut a list into one chunk per worker, each chunk's size proportional to the worker's weight."""
     items, total, shares, start = list(items), sum(w["weight"] for w in workers), [], 0
-    for k, w in enumerate(workers):
-        end = len(items) if k == len(workers) - 1 else start + round(len(items) * w["weight"] / total)
-        shares.append(items[start:end])
-        start = end
+    exact = [len(items) * w["weight"] / total for w in workers]
+    counts = [int(x) for x in exact]                       # whole items first ...
+    leftover = len(items) - sum(counts)                    # ... then the leftovers go to the biggest fractional parts
+    for k in sorted(range(len(workers)), key=lambda k: exact[k] - counts[k], reverse=True)[:leftover]:
+        counts[k] += 1
+    for n in counts:
+        shares.append(items[start:start + n])
+        start += n
     return shares
 
 
@@ -376,7 +381,7 @@ def step1_rfd3(S, out):
     for k, (w, count) in enumerate(zip(workers, counts)):
         if not count:
             continue
-        size = min(batch, count)
+        size = min(int(w.get("batch") or batch), count)         # a small card can have its own, smaller batch
         wdir = raw / f"w{k}"
         cmd = w["cmd"] + [f"out_dir={wdir}", f"inputs={spec_path}", f"diffusion_batch_size={size}",
                           f"n_batches={-(-count // size)}", "skip_existing=False", "prevalidate_inputs=True"]
@@ -518,7 +523,10 @@ def step1_rfd4(S, out):
         wdir = raw / f"w{k}"
         # RFD4's default seed is fixed, so two workers would make the SAME designs: give each worker its own seed
         cmd = w["cmd"] + [f"inputs={spec_path}", f"out_dir={wdir}", f"num_replicates={count}",
-                          f"batch_size={min(batch, count)}", f"seed={int(S.get('rfd4_seed', 1)) + 1000 * k}", "~metrics"]
+                          f"batch_size={min(int(w.get('batch') or batch), count)}",
+                          f"seed={int(S.get('rfd4_seed', 1)) + 1000 * k}"]
+        if not any(str(a).startswith("inference_experiment=") for a in w["cmd"]):
+            cmd.append("~metrics")                  # (the "quickstart" experiment already skips the metrics)
         if S.get("rfd4_ckpt"):
             cmd.append(f"hf_ckpt_path={S['rfd4_ckpt']}")
         if S.get("rfd4_revision"):

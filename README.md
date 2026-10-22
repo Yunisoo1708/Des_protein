@@ -78,6 +78,12 @@ predictions took 51 min with 1 worker per card and **20.6 min with 4 workers on 
 (median), but 5 of 200 designs flipped pass/fail, mostly designs sitting right on the RMSD limit.
 `--output_dir` re-runs a stage into a different folder without touching earlier results.
 
+**Both cards of the two-GPU server with the current tools: `settings_dual_gpu.py`** (same environment variables as `settings_big_gpu.py`, plus per-card counts `RFD_WORKERS_0/_1`, `MPNN_WORKERS_0/_1`, `AF2_WORKERS_0/_1`). It picks the right AF2 environment for each card (`af2_bw` for the 5060 Ti, `af2_bd` for the 1660 SUPER), shares work by measured speed and can give each card its own batch size (`"batch"` in a worker). Measured on 5YXH, same inputs, one run each:
+- **AF2, 96 predictions:** 584 s with 6 workers on the 5060 Ti alone, **510 s with 6 on the 5060 Ti + 2 on the 1660 SUPER** (1.15x). Identical pass set (9 of 96) and pAE within 0.06 between the cards. The gain is small because AF2 is CPU-bound (16 cores) and the 1660's workers are slower (about 0.7x per worker, and they start about 75 s later). With only 24 predictions the dual setup was *slower* (the 1660 workers' start-up dominates), so use it for big batches.
+- **RFD3:** about 4x slower per design on the 1660 SUPER (47 s vs 11.4 s), so it gets a 4 : 1 share.
+- **RFD4: leave the 1660 SUPER out** (the default with `BACKBONE_TOOL=rfd4`). It cannot run RFD4's default bf16 attention (error `Invalid backend`), so it needs `precision=32-true` and no compile, and then needs about 125 s per design against 9.9 s on the 5060 Ti. Adding it (`RFD_WORKERS_1=1`) made the 24-design run no faster: 22 designs on the 5060 Ti are split 8+8+6, and the odd batch of 6 forces a recompile, so choose `NUM_BACKBONES` as a multiple of `RFD4_BATCH`.
+- **Whole pipeline, 24 RFD4 designs:** 432 s on the 5060 Ti alone vs 539 s dual (cold AF2 cache on the 1660 and the odd batch); see `real_run/timing_dual_gpu_rfd4.txt`.
+
 **How many workers per GPU?** Add `"copies": N` to a worker to run N identical workers on one card (JAX's
 memory grab is switched off automatically). The easy way is the `WORKERS_PER_GPU` block at the top of
 `settings_server_parallel.py` (two cards) or `settings_big_gpu.py` (one card; numbers can

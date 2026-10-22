@@ -196,8 +196,10 @@ def rfd4(args):
     Like the real tool: <out_dir>/inference_samples/<name>_<i>/<name>_<i>_generated.cif, with the target pieces keeping their
     chain letters (each numbered from 1), the binder in the next free letter WITH a real sequence, and NO B-factor column."""
     from Bio.PDB.MMCIF2Dict import MMCIF2Dict
-    assert "~metrics" in args, "the pipeline should skip RFD4's metrics (they need other tools)"
+    assert "~metrics" in args or "inference_experiment=quickstart" in args, "RFD4's metrics (they need other tools) must be skipped"
     kv = dict(a.split("=", 1) for a in args if "=" in a)
+    Path(kv["out_dir"]).mkdir(parents=True, exist_ok=True)
+    (Path(kv["out_dir"]) / "args.txt").write_text("\n".join(args))            # so a test can see what each worker was given
     text = Path(kv["inputs"]).read_text()
     contig = re.search(r'contig: "([^"]+)"', text).group(1)                      # e.g.  20-30, /0, A5-20, /0, B25-40
     source = MMCIF2Dict(re.search(r'input: "([^"]+)"', text).group(1))
