@@ -1,59 +1,116 @@
-"""Settings for ONE big GPU (for example an L40S or an H200), running several worker processes on it.
+"""Settings for ONE GPU (a laptop card, a cluster GPU, an L40S, an H200 ...), running several worker processes on it.
+Backbones come from RFdiffusion 3 (RFD3); BACKBONE_TOOL=rfd4 uses RFD4-Proteina instead (it also designs the sequence, so
+ProteinMPNN is skipped); RFdiffusion 1 is still available with BACKBONE_TOOL=rfdiffusion.
 
-Quick timing sweep (no need to edit this file):
-    AF2_WORKERS=4  python design_pipeline.py --settings settings_big_gpu.py --stages af2,score_af2 --output_dir runs/af2_x4
-    AF2_WORKERS=8  python design_pipeline.py --settings settings_big_gpu.py --stages af2,score_af2 --output_dir runs/af2_x8
-    AF2_WORKERS=16 python design_pipeline.py --settings settings_big_gpu.py --stages af2,score_af2 --output_dir runs/af2_x16
-(copy the finished 1_rfdiffusion and 2_mpnn folders into each --output_dir first, so only AF2 is re-run).
+Everything is set with environment variables, so the same file runs any target on any machine:
 
-Expected tools layout (what the install scripts in this project create):
-    ~/tools/RFdiffusion, ~/tools/ProteinMPNN, ~/tools/dl_binder_design
-    conda envs: "rfdiffusion" (PyTorch 2.4 + real DGL; fine on Ada/Hopper cards) and "af2_bd" (JAX 0.4.20 + PyRosetta)
+    GPU=1 TARGET_PDB=/path/target.pdb TARGET_RANGE=A16-108,A113-151 HOTSPOTS=A31,A32 BINDER_LENGTH=55-55 \
+    NUM_BACKBONES=4 SEQS_PER_BACKBONE=2 AF2_WORKERS=2 RFD_WORKERS=1 RFD3_BATCH=2 \
+    python design_pipeline.py --settings settings_big_gpu.py --output_dir runs/trial1 --stages rfd,mpnn,af2,score_af2
+
+Required:  TARGET_PDB, TARGET_RANGE, HOTSPOTS        (TARGET_RANGE uses commas between pieces: A16-108,A113-151;
+                                                      a bare number between pieces, A16-108,4,A113-151, designs 4 new residues)
+Optional:  GPU (which card, default 0)   BINDER_LENGTH (55-55)   NUM_BACKBONES (50)   SEQS_PER_BACKBONE (4)
+           RFD_WORKERS (2)  AF2_WORKERS (8)  MPNN_WORKERS (1)  RFD3_BATCH (1)  RFD3_OVERRIDES ("")
+           ENVS_DIR, TOOLS_DIR, RFD3_BIN, RFD3_CKPT, MPNN_PY, BACKBONE_TOOL (rfd3 | rfd4 | rfdiffusion)
+           RFD4_BIN ($ENVS_DIR/rfd4_env/bin/rfd4-generate)  RFD4_BATCH (8)  RFD4_MPNN (1 = also redesign with ProteinMPNN)  RFD4_SEED
+           AF2_ENV (conda env that runs AF2: af2_bd by default; use af2_bw on an RTX 50xx / Blackwell card)
+
+Expected layout (what install_envs.sh creates):
+    $TOOLS_DIR/ProteinMPNN, $TOOLS_DIR/dl_binder_design           (and $TOOLS_DIR/RFdiffusion only for BACKBONE_TOOL=rfdiffusion)
+    conda envs in $ENVS_DIR:  "rfd3_env" (RFD3 + ProteinMPNN) and "af2_bd" (AF2 + PyRosetta)
+    RFD3 weights:             $RFD3_CKPT   (default ~/.foundry/checkpoints/rfd3_latest.ckpt)
 """
 import os
 from pathlib import Path
 
-# ---- EDIT THESE: how many worker processes to run on the GPU ----------------------------------------------------
-# These are untested starting guesses for a 48 GB card. Why:
-#  - AF2 spends ~16 of every ~20 s per prediction on ONE CPU core, so it can use roughly as many workers as you
-#    have free CPU cores (each worker used under 5 GB of GPU memory on the RTX 5060 Ti).
-#  - RFdiffusion is GPU-heavy, so a few workers are enough to keep the card busy (about 4 GB each there).
+
+def need(name):
+    value = os.environ.get(name)
+    if not value:
+        raise SystemExit(f"Set {name} first (see the top of settings_big_gpu.py), e.g.  {name}=...  python design_pipeline.py ...")
+    return value
+
+
+# ---- how many worker processes to run on the GPU ------------------------------------------------------------------
+#  - AF2 spends ~16 of every ~20 s per prediction on ONE CPU core, so it can use about as many workers as you have
+#    free CPU cores (each worker used 1-1.5 GB of GPU memory on the RTX 5060 Ti).
+#  - RFD3 is GPU-heavy: on a 6 GB GTX 1660 SUPER one worker with RFD3_BATCH=2 already used 5 GB.
 WORKERS_PER_GPU = {
-    "rfdiffusion": int(os.environ.get("RFD_WORKERS", 3)),
+    "rfdiffusion": int(os.environ.get("RFD_WORKERS", 2)),     # backbone workers (RFD3 or RFdiffusion 1)
     "mpnn":        int(os.environ.get("MPNN_WORKERS", 1)),
     "af2":         int(os.environ.get("AF2_WORKERS", 8)),
 }
-GPU = os.environ.get("GPU", "0")          # which card (as listed by nvidia-smi)
-# -----------------------------------------------------------------------------------------------------------------
+GPU = os.environ.get("GPU") or os.environ.get("CUDA_VISIBLE_DEVICES", "0")   # which card; a cluster job sets it for you
 
 HOME = Path.home()
-ENVS, TOOLS = HOME / "miniconda3/envs", HOME / "tools"
-CACHE = {"JAX_COMPILATION_CACHE_DIR": str(HOME / ".cache/jax_af2"), "JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS": "0"}
+ENVS = Path(os.environ.get("ENVS_DIR", HOME / "miniconda3/envs"))
+TOOLS = Path(os.environ.get("TOOLS_DIR", HOME / "tools"))
+RFD3_BIN = os.environ.get("RFD3_BIN", str(ENVS / "rfd3_env/bin/rfd3"))
+RFD3_CKPT = os.environ.get("RFD3_CKPT", str(HOME / ".foundry/checkpoints/rfd3_latest.ckpt"))
+MPNN_PY = os.environ.get("MPNN_PY", str(ENVS / "rfd3_env/bin/python"))
+RFD4_BIN = os.environ.get("RFD4_BIN", str(ENVS / "rfd4_env/bin/rfd4-generate"))     # made by: bash install_envs.sh rfd4_env
+REGLYCO_BIN = os.environ.get("REGLYCO_BIN", str(TOOLS / "reglyco/bin/reglyco"))       # glycosylation scan (optional)
+AF2_ENV = os.environ.get("AF2_ENV", "af2_bd")        # "af2_bw" = newer JAX, needed by Blackwell cards (RTX 50xx)
+CACHE = {"JAX_COMPILATION_CACHE_DIR": str(HOME / (".cache/jax_af2" if AF2_ENV == "af2_bd" else f".cache/jax_{AF2_ENV}")),
+         "JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS": "0"}
 
 
-def workers(python, script, n, extra_env=None):
-    """n identical workers on the one card (the pipeline turns off JAX's memory grab when n > 1)."""
-    return [{"cmd": [str(python), str(script)], "env": {"CUDA_VISIBLE_DEVICES": GPU, **(extra_env or {})},
+def workers(program, script, n, extra_env=None):
+    """n identical workers on the one card (the pipeline turns off JAX's memory grab when n > 1).
+    The env's own lib folder goes first in LD_LIBRARY_PATH, so its newer C++ runtime is used on clusters
+    whose system libstdc++ is too old (error: GLIBCXX_3.4.xx not found). script=None: the program needs no script."""
+    env_lib = Path(program).parent.parent / "lib"
+    lib_path = f"{env_lib}:{os.environ.get('LD_LIBRARY_PATH', '')}".rstrip(":")
+    return [{"cmd": [str(program)] + ([str(script)] if script else []),
+             "env": {"CUDA_VISIBLE_DEVICES": GPU, "LD_LIBRARY_PATH": lib_path, **(extra_env or {})},
              "weight": 1, "copies": n}]
 
 
 SETTINGS = {
-    "target_pdb": str(TOOLS / "RFdiffusion/examples/input_pdbs/insulin_target.pdb"),   # example target
-    "target_range": "A1-150",
-    "hotspots": "A59,A83,A91",
-    "binder_length": "55-55",      # fixed length: AF2 compiles only once
-    "num_backbones": 50,
-    "seqs_per_backbone": 4,
-    "rfd_noise": 0,
-    "output_dir": str(HOME / "run_big_gpu"),
+    "backbone_tool": os.environ.get("BACKBONE_TOOL", "rfd3"),
+    "target_pdb": need("TARGET_PDB"),
+    "target_range": need("TARGET_RANGE"),
+    "hotspots": need("HOTSPOTS"),
+    "binder_length": os.environ.get("BINDER_LENGTH", "55-55"),   # a fixed length ("55-55") lets AF2 compile only once
+    "num_backbones": int(os.environ.get("NUM_BACKBONES", 50)),
+    "seqs_per_backbone": int(os.environ.get("SEQS_PER_BACKBONE", 4)),
+    "output_dir": str(HOME / "run_big_gpu"),    # override on the command line with --output_dir
 
+    # RFdiffusion 3: "design" is the sub-command of the rfd3 program
+    "rfd3_workers": workers(RFD3_BIN, "design", WORKERS_PER_GPU["rfdiffusion"]),
+    "rfd3_ckpt": RFD3_CKPT,
+    "rfd3_batch_size": int(os.environ.get("RFD3_BATCH", 1)),    # designs made at once (2 = ~1.8x faster, needs more GPU memory)
+    "rfd3_overrides": os.environ.get("RFD3_OVERRIDES", "").split(),   # e.g. "inference_sampler.step_scale=1.5"
+
+    # RFD4-Proteina (only used with BACKBONE_TOOL=rfd4): designs backbone AND sequence, so ProteinMPNN is skipped
+    # unless RFD4_MPNN=1. RFD4_BATCH designs are made at once (8 used 5.4 GB for a 55-residue binder; the first run compiles
+    # the model for about 4 minutes, later runs reuse the cache).
+    "rfd4_workers": workers(RFD4_BIN, None, WORKERS_PER_GPU["rfdiffusion"]),
+    "rfd4_ckpt": os.environ.get("RFD4_CKPT", "nvidia/RFD4-Proteina"),         # Hugging Face name of the weights
+    "rfd4_batch_size": int(os.environ.get("RFD4_BATCH", 8)),
+    "rfd4_mpnn": os.environ.get("RFD4_MPNN", "") == "1",
+    "rfd4_overrides": os.environ.get("RFD4_OVERRIDES", "").split(),           # e.g. "hf_ckpt_revision=<commit>" or "seed=7"
+    **({"rfd4_seed": int(os.environ["RFD4_SEED"])} if os.environ.get("RFD4_SEED") else {}),
+
+    # RFdiffusion 1 (only used with BACKBONE_TOOL=rfdiffusion)
+    "rfd_noise": 0,
     "rfdiffusion_workers": workers(ENVS / "rfdiffusion/bin/python", TOOLS / "RFdiffusion/scripts/run_inference.py",
                                    WORKERS_PER_GPU["rfdiffusion"]),
-    "mpnn_workers": workers(ENVS / "rfdiffusion/bin/python", TOOLS / "ProteinMPNN/protein_mpnn_run.py",
-                            WORKERS_PER_GPU["mpnn"]),
-    "af2_workers": workers(ENVS / "af2_bd/bin/python", TOOLS / "dl_binder_design/af2_initial_guess/predict.py",
+
+    "mpnn_workers": workers(MPNN_PY, TOOLS / "ProteinMPNN/protein_mpnn_run.py", WORKERS_PER_GPU["mpnn"]),
+    "af2_workers": workers(ENVS / AF2_ENV / "bin/python", TOOLS / "dl_binder_design/af2_initial_guess/predict.py",
                            WORKERS_PER_GPU["af2"], CACHE),
     "af2_recycles": 3,
 
     "min_iptm": 0.8, "min_plddt": 80, "max_rmsd": 2.0, "max_pae_interaction": 10,
+
+    # Target glycosylation scan (stage "glyco"): the built-in sequon + exposure scan always runs; ReGlyco is added when its
+    # program exists (install_envs.sh reglyco), NetNGlyc when you give its result file (NETNGLYC_OUTPUT) or its program.
+    "glyco_warn_A": float(os.environ.get("GLYCO_WARN_A", 15)),              # warn if a sequon is this close (A) to a hotspot
+    "reglyco_cache": os.environ.get("GLYCO_CACHE", str(HOME / ".cache/reglyco")),   # keep between runs: one download only
+    "reglyco_offline": os.environ.get("REGLYCO_OFFLINE", "") == "1",         # on machines without internet (after one online run)
+    **({"reglyco_cmd": [REGLYCO_BIN]} if Path(REGLYCO_BIN).exists() else {}),
+    **({"netnglyc_output": os.environ["NETNGLYC_OUTPUT"]} if os.environ.get("NETNGLYC_OUTPUT") else {}),
+    **({"netnglyc_cmd": [os.environ["NETNGLYC_BIN"]]} if os.environ.get("NETNGLYC_BIN") else {}),
 }

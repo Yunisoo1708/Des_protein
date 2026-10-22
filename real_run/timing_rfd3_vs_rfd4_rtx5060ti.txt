@@ -1,0 +1,17 @@
+RFD3 vs RFD4-Proteina on target 5YXH (chains A16-108 + A113-151, hotspots A31 A32 A122 A123, 55-residue binder)
+GPU: RTX 5060 Ti (16 GB), Goof server, 2026-10-22. One run per setting, so treat small differences as noise.
+
+GENERATION, 24 designs (wall-clock for the whole command, includes ~15-25 s start-up)
+  RFD4  quickstart (no torch.compile), batch 4 : 450 s  (18.8 s/design)  peak GPU memory 3.8 GB
+  RFD4  compiled, batch 8, first run           : 279 s  (one-time compile ~255 s is inside this)
+  RFD4  compiled, batch 8, compile cache warm  : 237 s  ( 9.9 s/design)  peak GPU memory 5.4 GB
+  RFD3  batch 4                                : 348 s  (14.5 s/design)  peak GPU memory 4.3 GB
+  RFD3  batch 8                                : 273 s  (11.4 s/design)  peak GPU memory 6.2 GB
+  (NVIDIA's blog claims 1.35 s vs 5.12 s per 200-residue design and 1.36 GB vs 8.50 GB; not reproduced here.
+   cuEquivariance kernels were not installed, which may account for part of the gap.)
+
+QUALITY, AF2 initial guess (af2_bw environment, 6 workers on the same card), pass = pAE_interaction<=10, pLDDT>=80, RMSD<=2
+  A  RFD4 backbone + RFD4's own sequence (24 designs)      : 3 pass  (12.5%)   AF2 stage 373 s incl. JAX compile
+  B  RFD3 backbone + ProteinMPNN x4        (96 sequences)  : 0 pass            ProteinMPNN + AF2 699 s
+  C  RFD4 backbone + ProteinMPNN x4        (96 sequences)  : 9 pass  (9.4%)    ProteinMPNN + AF2 696 s
+  Passing backbones: RFD4 #4, #10, #17, #22, #23 (5 of 24).  RFD3's earlier GTX 1660 SUPER run also gave 0/96.

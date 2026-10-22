@@ -6,9 +6,10 @@ They copy the real tools' command-line options and output file names/formats, bu
 random helices and the "predictions" are the input backbone plus known noise. So this tests the
 plumbing (commands, file parsing, pAE / iPTM / pLDDT / RMSD maths), NOT design quality.
 
-Usage:  python fake_tools.py rfdiffusion|mpnn|af2|afserver  <the same arguments the real tool takes>
+Usage:  python fake_tools.py rfdiffusion|rfd3|rfd4|mpnn|af2|afserver|reglyco  <the same arguments the real tool takes>
 """
 import argparse
+import gzip
 import json
 import re
 import sys
@@ -147,6 +148,117 @@ def afserver(args):
             z.write(d / f"{name}_confidences.json", f"fold_{name}_full_data_0.json")
 
 
+# ---------------------------------------------------------------- RFdiffusion 3  (rfd3 design ...)
+AA3 = ["ALA", "ARG", "ASN", "ASP", "CYS", "GLN", "GLU", "GLY", "HIS", "ILE",
+       "LEU", "LYS", "MET", "PHE", "PRO", "SER", "THR", "TRP", "TYR", "VAL"]
+
+
+def rfd3(args):
+    """Pretend to be `rfd3 design out_dir=... inputs=spec.json diffusion_batch_size=.. n_batches=..`.
+    Like the real tool: files are <specname>_<key>_<batch>_model_<n>.cif.gz + .json; the BINDER is chain A with a real
+    sequence; the TARGET is chain B renumbered from 1, and the JSON's diffused_index_map says A16 -> B1 and so on."""
+    kv = dict(a.split("=", 1) for a in args if "=" in a)
+    out = Path(kv["out_dir"])
+    out.mkdir(parents=True, exist_ok=True)
+    spec_file = Path(kv["inputs"])
+    key, spec = next(iter(json.loads(spec_file.read_text()).items()))
+    parts = [p for p in spec["contig"].split(",") if p != "/0"]            # e.g. ["20-30", "A5-20", "A25-40"]
+    bits = parts[0].split("-")
+    lo, hi = int(bits[0]), int(bits[-1])
+    source = read_pdb(spec["input"])
+    target, index_map = [], {}                                                  # kept target residues
+    for p in parts[1:]:
+        m = re.fullmatch(r"([A-Za-z])(\d+)-(\d+)", p)
+        if m:
+            chain, a, b = m.group(1), int(m.group(2)), int(m.group(3))
+            for number in range(a, b + 1):
+                target.append(source[chain][number - 1])                        # toy PDBs are numbered from 1
+                index_map[f"{chain}{number}"] = f"B{len(target)}"
+    for batch in range(int(kv.get("n_batches", 1))):
+        length = int(np.random.default_rng(zlib.crc32(f"{out}{batch}".encode())).integers(lo, hi + 1))   # one length per batch
+        for n in range(int(kv.get("diffusion_batch_size", 8))):
+            rng = np.random.default_rng(zlib.crc32(f"{out}_{batch}_{n}".encode()))
+            centre = np.array([0, 0, 1.5 * (len(target) - length) / 2])
+            binder = [(AA3[int(i)], x) for i, x in zip(rng.integers(0, 20, length), helix(length) + centre + np.array([10.0, 0, 0]))]
+            name = f"{spec_file.stem}_{key}_{batch}_model_{n}"
+            write_cif(out / f"{name}.cif", name, {"A": binder, "B": target})
+            with open(out / f"{name}.cif", "rb") as src, gzip.open(out / f"{name}.cif.gz", "wb") as dst:
+                dst.write(src.read())
+            (out / f"{name}.cif").unlink()
+            (out / f"{name}.json").write_text(json.dumps(
+                {"diffused_index_map": index_map, "metrics": {"n_chainbreaks": 0, "max_ca_deviation": 0.1},
+                 "specification": spec, "ckpt_path": kv.get("ckpt_path"), "seed": None}))
+
+
+# ---------------------------------------------------------------- RFD4-Proteina  (rfd4-generate inputs=spec.yaml ...)
+def rfd4(args):
+    """Pretend to be `rfd4-generate inputs=spec.yaml out_dir=.. num_replicates=.. batch_size=.. seed=.. ~metrics`.
+    Like the real tool: <out_dir>/inference_samples/<name>_<i>/<name>_<i>_generated.cif, with the target pieces keeping their
+    chain letters (each numbered from 1), the binder in the next free letter WITH a real sequence, and NO B-factor column."""
+    from Bio.PDB.MMCIF2Dict import MMCIF2Dict
+    assert "~metrics" in args, "the pipeline should skip RFD4's metrics (they need other tools)"
+    kv = dict(a.split("=", 1) for a in args if "=" in a)
+    text = Path(kv["inputs"]).read_text()
+    contig = re.search(r'contig: "([^"]+)"', text).group(1)                      # e.g.  20-30, /0, A5-20, /0, B25-40
+    source = MMCIF2Dict(re.search(r'input: "([^"]+)"', text).group(1))
+    assert "C_HOT: {true: [" in text and "C_CRDGRP: {1: [" in text, "conditions must be written the way RFD4's examples do"
+    parts = [p.strip() for p in contig.split(",") if p.strip() != "/0"]
+    lo, hi = int(parts[0].split("-")[0]), int(parts[0].split("-")[-1])
+    pieces = {}
+    for p in parts[1:]:
+        letter, a, b = re.fullmatch(r"([A-Z])(\d+)-(\d+)", p).groups()
+        xyz = [(int(n), np.array([float(x), float(y), float(z)])) for c, n, x, y, z in zip(
+            source["_atom_site.auth_asym_id"], source["_atom_site.auth_seq_id"], source["_atom_site.Cartn_x"],
+            source["_atom_site.Cartn_y"], source["_atom_site.Cartn_z"]) if c == letter]
+        pieces[letter] = [x for n, x in xyz if int(a) <= n <= int(b)]
+    binder_letter = next(c for c in "ABCDEFGHIJ" if c not in pieces)
+    out = Path(kv["out_dir"]) / "inference_samples"
+    n_total = int(kv["num_replicates"])
+    target_len = sum(len(v) for v in pieces.values())
+    for i in range(n_total):
+        rng = np.random.default_rng(int(kv["seed"]) * 100003 + i)                 # a different seed gives different designs
+        length = int(rng.integers(lo, hi + 1))
+        binder = [(AA3[int(k)], x) for k, x in zip(rng.integers(0, 20, length),
+                                                   helix(length) + np.array([10.0, 0, 1.5 * (target_len - length) / 2]))]
+        chains = {binder_letter: binder}                                            # the real file lists the binder first
+        chains.update({c: [(("ALA"), x) for x in v] for c, v in pieces.items()})
+        name = f"design_{i}"
+        d = out / name
+        d.mkdir(parents=True, exist_ok=True)
+        head = ["data_" + name + "_generated.cif", "loop_"] + ["_atom_site." + c for c in
+                "group_PDB type_symbol label_atom_id label_alt_id label_comp_id label_asym_id label_entity_id label_seq_id "
+                "pdbx_PDB_ins_code auth_seq_id auth_comp_id auth_asym_id auth_atom_id occupancy Cartn_x Cartn_y Cartn_z "
+                "pdbx_PDB_model_num id".split()]
+        rows, k = [], 1
+        for cid, residues in chains.items():
+            for r, (res, xyz) in enumerate(residues, start=1):
+                rows.append(f"ATOM C CA . {res} {cid} 1 {r} . {r} {res} {cid} CA 1.0 {xyz[0]:.3f} {xyz[1]:.3f} {xyz[2]:.3f} 1 {k}")
+                k += 1
+        (d / f"{name}_generated.cif").write_text("\n".join(head + rows) + "\n#\n")
+    print(f"fake RFD4 wrote {n_total} designs (seed {kv['seed']})")
+
+
+# ---------------------------------------------------------------- ReGlyco  (reglyco scan --protein X --output DIR ...)
+def reglyco(args):
+    """Pretend to be `reglyco scan`: writes scan.json with the real tool's layout. The FIRST sequon is called accessible,
+    every other sequon is called not accessible (so a test can see both answers)."""
+    kv = {a: args[i + 1] for i, a in enumerate(args) if a.startswith("--") and i + 1 < len(args)}
+    chains = read_pdb(kv["--protein"])
+    out = Path(kv["--output"])
+    out.mkdir(parents=True, exist_ok=True)
+    sites = []
+    for chain, residues in chains.items():
+        seq = "".join(seq1(n) for n, _ in residues)
+        for m in re.finditer(r"(?=(N[^P][ST]))", seq):
+            asn = {"chain": chain, "insertion_code": None, "number": m.start() + 1}      # toy PDBs are numbered from 1
+            sites.append({"accessible": not sites, "cluster": 1, "generations": 9, "joint_subset": not sites, "phi": 56.2,
+                          "psi": -178.9, "rotamer": None, "steric_score": 1.0 if not sites else 0.2,
+                          "sequon": {"asparagine": asn, "motif": m.group(1)}})
+    (out / "scan.json").write_text(json.dumps({"glycan": "G14843DJ", "status": "complete", "sites": sites,
+                                               "interpretation": "structural accessibility only; not proof of biological glycosylation"}))
+    print(f"Scanned {len(sites)} sequon(s)")
+
+
 # ---------------------------------------------------------------- AF2 initial guess (dl_binder_design predict.py)
 def af2(args):
     p = argparse.ArgumentParser()
@@ -170,4 +282,5 @@ def af2(args):
 
 
 if __name__ == "__main__":
-    {"rfdiffusion": rfdiffusion, "mpnn": mpnn, "afserver": afserver, "af2": af2}[sys.argv[1]](sys.argv[2:])
+    {"rfdiffusion": rfdiffusion, "rfd3": rfd3, "rfd4": rfd4, "mpnn": mpnn, "afserver": afserver, "af2": af2,
+     "reglyco": reglyco}[sys.argv[1]](sys.argv[2:])

@@ -3,6 +3,7 @@ Protein binder design pipeline:   RFdiffusion  ->  ProteinMPNN  ->  AlphaFold2 "
 
 What each tool does (one line each):
   1. RFdiffusion : draws NEW protein backbones (just the "skeleton", no sequence) that stick to your target.
+                   (Optional: RFD4-Proteina, "backbone_tool": "rfd4", also designs the sequence, so step 2 is skipped.)
   2. ProteinMPNN : writes amino-acid sequences that should fold into each skeleton.
   3. AF2 (dl_binder_design, Bennett et al.) : predicts the structure of (binder + target) from each sequence,
                    starting from the designed backbone, to check that the design is self-consistent.
@@ -25,6 +26,7 @@ How to run (inside WSL / Linux, where the tools live):
 """
 import argparse
 import csv
+import gzip
 import json
 import os
 import re
@@ -34,7 +36,10 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
-from Bio.PDB import MMCIFParser, PDBParser
+from Bio.PDB import MMCIFParser, PDBIO, PDBParser
+from Bio.PDB.Chain import Chain
+from Bio.PDB.Model import Model
+from Bio.PDB.Structure import Structure
 from Bio.SeqUtils import seq1
 
 
@@ -101,9 +106,14 @@ def read_chains(path):
     return chains
 
 
-def find_binder_and_target(chains):
-    """RFdiffusion writes the NEW residues as Glycine (no sequence yet), so the chain
-    with the most Glycine is the binder and the other chain is the target."""
+def find_binder_and_target(chains, pdb=None):
+    """Which chain is the binder and which is the target?
+    - RFD3 backbones come with a small side file (design_N.json, written by convert_rfd3_output) that says so.
+    - RFdiffusion 1 writes the NEW residues as Glycine (no sequence yet), so the chain with the most
+      Glycine is the binder and the other chain is the target."""
+    if pdb is not None and Path(pdb).with_suffix(".json").exists():
+        side = json.loads(Path(pdb).with_suffix(".json").read_text())
+        return side["binder_chain"], side["target_chain"]
     if len(chains) != 2:
         raise ValueError(f"Expected 2 chains (binder + target), found {list(chains)}")
     gly_fraction = {c: np.mean([name == "GLY" for name, _ in res]) for c, res in chains.items()}
@@ -117,11 +127,426 @@ def sequence_of(residues):
 
 
 # ----------------------------------------------------------------------------
-# Step 1: RFdiffusion  (make backbones)
+# Step 0 (stage "glyco"): where could the TARGET carry N-glycans?   Needs no GPU; takes seconds.
+#   1. Sequon scan: Asn-X-Ser/Thr (X is not Pro) in the target chain = where an N-glycan CAN be attached.
+#   2. Structure check: is that Asn on the surface? (Shrake-Rupley solvent exposure, about 150 A^2 = fully exposed Asn)
+#   3. Optional predictors that say whether the site is really occupied:
+#        - ReGlyco "scan" (structure based; runs automatically when "reglyco_cmd" is in the settings)
+#        - NetNGlyc (sequence based, human-trained): the DTU website needs a sign-in, so the pipeline writes the FASTA
+#          file, you run NetNGlyc there (or with the standalone program) and give the output back
+#          with  --netnglyc_output <file>  or  "netnglyc_cmd" in the settings.
+#   4. Warnings: sequons near your hotspots, or just outside the kept target range.
+#   N-glycosylation only happens to proteins that pass through the secretory pathway (secreted / membrane proteins).
 # ----------------------------------------------------------------------------
-def step1_rfdiffusion(S, out):
+SEQUON = re.compile(r"(?=(N[^P][ST]))")            # Asn - X (not Pro) - Ser/Thr; the lookahead also finds overlapping motifs
+ASN_FULL_SASA = 150.0                               # roughly the solvent-exposed area of a fully exposed Asn (A^2)
+
+
+def contig_pieces(target_range):
+    """'A16-108,A113-151' (or 'A16-108/A113-151') -> [('A', 16, 108), ('A', 113, 151)]; bare numbers are ignored."""
+    return [(c, int(a), int(b)) for c, a, b in re.findall(r"([A-Za-z]+)(\d+)-(\d+)", target_range)]
+
+
+def glyco_scan_baseline(S):
+    """Sequon scan + solvent exposure + distance to the hotspots, for the target chain of the input PDB."""
+    from Bio.PDB.SASA import ShrakeRupley
+    pieces = contig_pieces(S["target_range"])
+    if not pieces:
+        raise SystemExit("glyco: cannot read target_range (expected something like A16-108,A113-151)")
+    chain_id = pieces[0][0]
+    structure = PDBParser(QUIET=True).get_structure("target", str(Path(S["target_pdb"]).resolve()))
+    ShrakeRupley().compute(structure[0], level="R")                       # sets residue.sasa
+    residues = [r for r in structure[0][chain_id] if r.id[0] == " " and "CA" in r]
+    by_number = {r.id[1]: r for r in residues}
+    kept = lambda n: any(c == chain_id and a <= n <= b for c, a, b in pieces)
+    hotspots = []
+    for h in S["hotspots"].split(","):
+        m = re.fullmatch(r"\s*([A-Za-z]+)(\d+)\s*", h)
+        if m and m.group(1) == chain_id and int(m.group(2)) in by_number:
+            hotspots.append((h.strip(), by_number[int(m.group(2))]["CA"].coord))
+    sequence = "".join(seq1(r.get_resname()) for r in residues)
+    rows = []
+    for m in SEQUON.finditer(sequence):
+        trio = residues[m.start():m.start() + 3]
+        numbers = [r.id[1] for r in trio]
+        if numbers[1] != numbers[0] + 1 or numbers[2] != numbers[1] + 1:
+            continue                                                       # a gap in the file: not a real motif
+        asn = trio[0]
+        near = min(((float(np.linalg.norm(asn["CA"].coord - xyz)), name) for name, xyz in hotspots), default=(None, ""))
+        rows.append({"chain": chain_id, "residue": numbers[0], "motif": m.group(1), "in_target_range": kept(numbers[0]),
+                     "sasa": round(float(asn.sasa), 1), "rsa": round(float(asn.sasa) / ASN_FULL_SASA, 2),
+                     "exposed": float(asn.sasa) / ASN_FULL_SASA >= 0.2,
+                     "nearest_hotspot": near[1], "hotspot_dist_A": None if near[0] is None else round(near[0], 1)})
+    index_to_number = {i + 1: r.id[1] for i, r in enumerate(residues)}     # FASTA position -> PDB residue number
+    return rows, chain_id, sequence, index_to_number
+
+
+def parse_netnglyc(text, index_to_number):
+    """Read NetNGlyc's text output. Lines look like:  <name> <position> <motif> <potential> (<n>/<m>) <result>
+    This is written from the public description of the output, NOT verified against a real output file; it prints
+    a warning when it recognises no line so that a different format is noticed."""
+    found = {}
+    for line in text.splitlines():
+        m = re.match(r"^\s*(\S+)\s+(\d+)\s+([A-Z]+)\s+([0-9]*\.[0-9]+)\s+\((\d+)/(\d+)\)\s+(\S+)", line)
+        if m and int(m.group(2)) in index_to_number:
+            found[index_to_number[int(m.group(2))]] = {"netnglyc_potential": float(m.group(4)),
+                                                        "netnglyc_jury": f"{m.group(5)}/{m.group(6)}",
+                                                        "netnglyc_call": m.group(7)}
+    if not found:
+        print("  ! no NetNGlyc result lines recognised in that file (is it the text output of NetNGlyc 1.0?)")
+    return found
+
+
+def reglyco_scan(S, folder):
+    """Run `reglyco scan` on the target PDB (CPU only, seconds). It attaches a GlcNAc sugar to every N-X-S/T sequon and
+    checks which sites can carry a glycan without clashing. Its own caveat: "structural accessibility only; not proof of
+    biological glycosylation". Returns {(chain, residue number): {...columns...}}.
+    The GlcNAc conformers come from the GlycoShape website the first time and are cached: set "reglyco_cache" to a folder that
+    is kept between runs, and "reglyco_offline": True on machines without internet (after one online run)."""
+    out = folder / "reglyco_scan"
+    cache = Path(S.get("reglyco_cache", folder / "reglyco_cache"))
+    cmd = [str(c) for c in S["reglyco_cmd"]] + ["scan", "--protein", str(Path(S["target_pdb"]).resolve()), "--output", str(out),
+                                                 "--overwrite", "--cache", str(cache), "--protein-cache", str(cache / "proteins")]
+    if S.get("reglyco_offline"):
+        cmd += ["--offline", "--protein-offline"]
+    run(cmd, env={"CUDA_VISIBLE_DEVICES": "", **(S.get("reglyco_env") or {})})
+    scan = json.loads((out / "scan.json").read_text())
+    sites = {}
+    for site in scan.get("sites", []):
+        asn = site["sequon"]["asparagine"]
+        sites[(asn["chain"], asn["number"])] = {"reglyco_accessible": bool(site["accessible"]),
+                                                "reglyco_joint": bool(site.get("joint_subset")),
+                                                "reglyco_steric_score": round(float(site.get("steric_score", 0.0)), 2)}
+    return sites
+
+
+def step0_glyco(S, out, netnglyc_output=None):
+    folder = out / "0_glyco"
+    folder.mkdir(parents=True, exist_ok=True)
+    rows, chain_id, sequence, index_to_number = glyco_scan_baseline(S)
+    (folder / "target.fasta").write_text(f">target_chain_{chain_id}\n{sequence}\n")          # for NetNGlyc (web or standalone)
+    write_csv(folder / "target_numbering.csv", [{"fasta_position": i, "pdb_residue": n} for i, n in index_to_number.items()])
+
+    predictors = {"structure (solvent exposure)": True}
+    # --- optional: ReGlyco scan (automatic) ---
+    if S.get("reglyco_cmd"):
+        reglyco = reglyco_scan(S, folder)
+        for r in rows:
+            r.update(reglyco.get((r["chain"], r["residue"]), {"reglyco_accessible": "", "reglyco_joint": "", "reglyco_steric_score": ""}))
+        extra = sorted(n for c, n in reglyco if c == chain_id and n not in {r["residue"] for r in rows})
+        if extra:
+            print(f"  ! ReGlyco also lists sequons that the built-in scan did not: {extra} (check the PDB numbering)")
+        predictors["ReGlyco scan"] = True
+    # --- optional: NetNGlyc (standalone program, or a result file from the website) ---
+    text = None
+    if S.get("netnglyc_cmd"):
+        text = subprocess.run([str(c) for c in S["netnglyc_cmd"]] + [str(folder / "target.fasta")], capture_output=True, text=True, check=True).stdout
+    elif netnglyc_output or S.get("netnglyc_output"):
+        text = Path(netnglyc_output or S["netnglyc_output"]).read_text()
+    if text is not None:
+        (folder / "netnglyc_output.txt").write_text(text)
+        scores = parse_netnglyc(text, index_to_number)
+        for r in rows:
+            r.update(scores.get(r["residue"], {"netnglyc_potential": "", "netnglyc_jury": "", "netnglyc_call": ""}))
+            r["netnglyc_glycosylated"] = bool(r["netnglyc_potential"] != "" and r["netnglyc_potential"] > 0.5)   # NetNGlyc default cut-off
+        predictors["NetNGlyc"] = True
+
+    for r in rows:
+        # Exposure alone cannot say a glycan is attached, so without a predictor the site is only a "candidate".
+        # With predictors: how many of those that ran (plus exposure) support "this site is glycosylated"?
+        if len(predictors) == 1:
+            r["support"] = "-"
+            r["verdict"] = "candidate (exposed)" if r["exposed"] else "candidate (buried)"
+            continue
+        votes = [r["exposed"]]
+        if "ReGlyco scan" in predictors:
+            votes.append(r.get("reglyco_accessible") is True)
+        if "NetNGlyc" in predictors:
+            votes.append(r.get("netnglyc_glycosylated") is True)
+        r["support"] = f"{sum(votes)}/{len(votes)}"
+        r["verdict"] = "likely" if all(votes) else ("possible" if any(votes) else "unlikely")
+    warn_dist = float(S.get("glyco_warn_A", 15.0))
+    for r in rows:
+        r["warning"] = "; ".join(w for w in (
+            "outside the kept target range (this glycan attachment point is not in the design model)" if not r["in_target_range"] else "",
+            f"within {warn_dist:g} A of hotspot {r['nearest_hotspot']}: a glycan here could block the binder"
+            if r["verdict"] not in ("unlikely", "candidate (buried)") and r["hotspot_dist_A"] is not None
+            and r["hotspot_dist_A"] <= warn_dist else "") if w)
+    if rows:
+        write_csv(folder / "glyco_sites.csv", rows)
+
+    print(f"  target chain {chain_id}: {len(sequence)} residues in the file; predictors used: {', '.join(predictors)}")
+    if not rows:
+        print("  -> no N-X-S/T sequon in the target: no N-glycan attachment site.")
+    for r in rows:
+        print(f"  Asn{r['residue']} ({r['motif']})  exposure {r['rsa']:.2f}  verdict: {r['verdict']} ({r['support']})"
+              f"  nearest hotspot {r['nearest_hotspot'] or '-'} at {r['hotspot_dist_A'] if r['hotspot_dist_A'] is not None else '-'} A"
+              f"{'  <-- ' + r['warning'] if r['warning'] else ''}")
+    if rows:
+        print(f"  Saved: {folder / 'glyco_sites.csv'}   (the FASTA for NetNGlyc is {folder / 'target.fasta'})")
+        print("  Note: these are predictions (ReGlyco itself says: structural accessibility only, not proof of glycosylation), and "
+              "N-glycosylation only happens to proteins that enter the secretory pathway: for an intracellular target, ignore this table.")
+    if "NetNGlyc" not in predictors:
+        print("  NetNGlyc not used: run it on 0_glyco/target.fasta and re-run with  --netnglyc_output <its text output>")
+    if "ReGlyco scan" not in predictors:
+        print("  ReGlyco not used: add 'reglyco_cmd' to the settings (see README) to add its structure-based scan")
+    return rows
+
+
+# ----------------------------------------------------------------------------
+# Step 1: backbones  (RFdiffusion 3 is the default; RFdiffusion 1 is still available)
+#   Both tools end up writing  1_rfdiffusion/design_0.pdb, design_1.pdb ...  so the later steps do not care which was used.
+#   Choose with the setting  "backbone_tool": "rfd3" | "rfdiffusion"  (default: rfd3 if the settings have rfd3_cmd / rfd3_workers).
+# ----------------------------------------------------------------------------
+def fresh_backbone_folder(out):
+    """1_rfdiffusion/ must not hold designs from an earlier run: both tools SKIP designs that already exist, and
+    the later steps would then mix old and new backbones."""
     folder = out / "1_rfdiffusion"
     folder.mkdir(parents=True, exist_ok=True)
+    old = sorted(folder.glob("design_*.pdb"))
+    if old:
+        raise SystemExit(f"{folder} already holds {len(old)} backbones from an earlier run.\n"
+                         f"Use a NEW --output_dir: mixing runs gives wrong results.")
+    return folder
+
+
+def natural_key(path):
+    return [int(t) if t.isdigit() else t for t in re.split(r"(\d+)", str(path))]
+
+
+def rfd3_spec(S):
+    """The design recipe RFD3 reads (JSON). The binder is designed first, then a chain break (/0), then the target.
+    Hotspots are given as residues; 'TIP' tells RFD3 to use each residue's tip atom (or write 'ALL')."""
+    contig = f"{S['binder_length']},/0,{S['target_range'].replace('/', ',')}"
+    atoms = S.get("rfd3_hotspot_atoms", "TIP")
+    hotspots = {r.strip(): atoms for r in S["hotspots"].split(",") if r.strip()}
+    spec = {"input": str(Path(S["target_pdb"]).resolve()), "contig": contig, "select_hotspots": hotspots,
+            "infer_ori_strategy": "hotspots", "is_non_loopy": True}
+    spec.update(S.get("rfd3_spec_extra", {}))       # advanced: any other RFD3 input field
+    return {"design": spec}
+
+
+def convert_rfd3_output(cif_gz, pdb_out):
+    """RFD3 writes designs as .cif.gz + .json (binder = first chain, target renumbered from 1). Convert one to the
+    layout used here: target = chain A with its ORIGINAL residue numbers, binder = chain B, plus a small
+    design_N.json side file saying which chain is which (RFD3 binders carry a real sequence, so the 'all glycine'
+    trick used for RFdiffusion 1 does not work)."""
+    cif_gz = Path(cif_gz)
+    meta = json.loads(cif_gz.with_name(cif_gz.name.replace(".cif.gz", ".json")).read_text())
+    with gzip.open(cif_gz, "rt") as handle:
+        model = MMCIFParser(QUIET=True).get_structure("x", handle)[0]
+    split = lambda s: (re.fullmatch(r"([A-Za-z]+)(-?\d+)", s).group(1), int(re.fullmatch(r"([A-Za-z]+)(-?\d+)", s).group(2)))
+    new_to_orig = {split(new): split(orig) for orig, new in meta["diffused_index_map"].items()}   # e.g. B1 <- A16
+    target_chains = {c for c, _ in new_to_orig}
+    chain_ids = [c.id for c in model]
+    if len(target_chains) != 1 or len(chain_ids) != 2:
+        raise ValueError(f"{cif_gz.name}: expected one binder chain + one target chain, found chains {chain_ids}")
+    target_out = target_chains.pop()
+    binder_out = [c for c in chain_ids if c != target_out][0]
+
+    residues = [r for r in model[target_out] if r.id[0] == " "]
+    restore = all((target_out, r.id[1]) in new_to_orig for r in residues)       # put the original numbers back
+    structure = Structure("design")
+    structure.add(Model(0))
+    for new_id, old_id in (("A", target_out), ("B", binder_out)):
+        chain = Chain(new_id)
+        for r in [r for r in model[old_id] if r.id[0] == " "]:
+            copy = r.copy()
+            number = new_to_orig[(old_id, r.id[1])][1] if (old_id == target_out and restore) else r.id[1]
+            copy.id = (" ", number, " ")
+            chain.add(copy)
+        structure[0].add(chain)
+    io = PDBIO()
+    io.set_structure(structure)
+    io.save(str(pdb_out))
+    Path(pdb_out).with_suffix(".json").write_text(json.dumps(
+        {"binder_chain": "B", "target_chain": "A", "source": cif_gz.name, "rfd3_metrics": meta.get("metrics", {})}, indent=1))
+
+
+def step1_rfd3(S, out):
+    folder = fresh_backbone_folder(out)
+    raw = out / "1_rfd3_raw"                                    # RFD3's own files, one sub-folder per worker
+    raw.mkdir(parents=True, exist_ok=True)
+    spec_path = raw / "spec.json"
+    spec_path.write_text(json.dumps(rfd3_spec(S), indent=1))
+    workers = workers_for(S, "rfd3")
+    counts = [len(c) for c in split_by_weight(range(S["num_backbones"]), workers)]      # designs per worker
+    batch = max(1, int(S.get("rfd3_batch_size", 1)))   # designs RFD3 makes at once (they share one binder length)
+    commands, plan = [], []
+    for k, (w, count) in enumerate(zip(workers, counts)):
+        if not count:
+            continue
+        size = min(batch, count)
+        wdir = raw / f"w{k}"
+        cmd = w["cmd"] + [f"out_dir={wdir}", f"inputs={spec_path}", f"diffusion_batch_size={size}",
+                          f"n_batches={-(-count // size)}", "skip_existing=False", "prevalidate_inputs=True"]
+        if S.get("rfd3_ckpt"):
+            cmd.append(f"ckpt_path={S['rfd3_ckpt']}")
+        cmd += [str(x) for x in S.get("rfd3_overrides", [])]        # advanced: any other RFD3 setting, e.g. inference_sampler.step_scale=1.5
+        commands.append((cmd, w.get("env")))
+        plan.append((wdir, count))
+    run_parallel(commands)
+    made = 0
+    for wdir, count in plan:
+        files = sorted(wdir.glob("*.cif.gz"), key=natural_key)[:count]
+        if len(files) < count:
+            raise SystemExit(f"RFD3 wrote {len(files)} designs in {wdir}, expected {count}: see the messages above")
+        for f in files:
+            convert_rfd3_output(f, folder / f"design_{made}.pdb")
+            made += 1
+    print(f"  -> {made} backbones made (RFD3)")
+    return sorted(folder.glob("design_*.pdb"))
+
+
+def backbone_tool(S):
+    return S.get("backbone_tool") or ("rfd3" if (S.get("rfd3_workers") or S.get("rfd3_cmd")) else
+                                      "rfd4" if (S.get("rfd4_workers") or S.get("rfd4_cmd")) else "rfdiffusion")
+
+
+# ---- RFD4-Proteina: designs the binder's SEQUENCE and structure together, so ProteinMPNN is not needed ---------------
+def rfd4_target(S, folder):
+    """RFD4 reads CIF (not PDB) and refuses to bond across a gap in the target, so every kept piece of the target becomes
+    its own chain (A, B, C ...) with its ORIGINAL residue numbers. Writes target.cif and returns
+    [(new_chain, original_chain, [original residue numbers])]."""
+    pieces = contig_pieces(S["target_range"])
+    if not pieces or re.search(r"(?:^|[,/])\s*\d+\s*(?:$|[,/])", S["target_range"]):
+        raise SystemExit("rfd4: target_range must be only kept pieces such as A16-108,A113-151 "
+                         "(a bare number that designs new residues in a gap is not supported with RFD4)")
+    model = PDBParser(QUIET=True).get_structure("target", str(Path(S["target_pdb"]).resolve()))[0]
+    # The CIF is written by hand: RFD4 takes the residue numbers from label_seq_id, and Biopython's writer renumbers that
+    # column from 1 in every chain. Here label_seq_id and auth_seq_id both hold the ORIGINAL numbers.
+    rows, layout, serial = [], [], 0
+    for entity, (letter, (chain_id, first, last)) in enumerate(zip("ABCDEFGHIJKLMNOPQRSTUVWXYZ", pieces), start=1):
+        have = {r.id[1]: r for r in model[chain_id] if r.id[0] == " " and "CA" in r}
+        missing = [n for n in range(first, last + 1) if n not in have]
+        if missing:
+            raise SystemExit(f"rfd4: target residues {chain_id}{missing[0]}... are not in the PDB file "
+                             f"(piece {chain_id}{first}-{last}); leave them out of target_range, e.g. A16-108,A113-151")
+        for n in range(first, last + 1):
+            res = have[n].get_resname()
+            for atom in have[n]:
+                element = (atom.element or atom.get_id()[0]).strip().upper()
+                if element in ("H", "D"):
+                    continue
+                serial += 1
+                x, y, z = atom.coord
+                rows.append(f"ATOM {serial} {element} {atom.get_id()} . {res} {letter} {entity} {n} ? {x:.3f} {y:.3f} {z:.3f} "
+                            f"1.00 {atom.get_bfactor():.2f} {n} {res} {letter} {atom.get_id()} 1")
+        layout.append((letter, chain_id, list(range(first, last + 1))))
+    head = ["data_target", "loop_"] + ["_atom_site." + c for c in
+            "group_PDB id type_symbol label_atom_id label_alt_id label_comp_id label_asym_id label_entity_id label_seq_id "
+            "pdbx_PDB_ins_code Cartn_x Cartn_y Cartn_z occupancy B_iso_or_equiv auth_seq_id auth_comp_id auth_asym_id "
+            "auth_atom_id pdbx_PDB_model_num".split()]
+    (folder / "target.cif").write_text("\n".join(head + rows) + "\n#\n")
+    return layout
+
+
+def rfd4_spec(S, layout, target_cif):
+    """The recipe RFD4 reads, as YAML text. Binder first, then each target piece after a chain break (/0).
+    conditions: the target's backbone and sequence are given (C_CRDGRP, C_SEQ) and the hotspot residues are marked (C_HOT).
+    The keys 1 and true are written bare on purpose: that is how RFD4's own examples spell them."""
+    q = json.dumps                                            # a JSON string is also a valid YAML string
+    letters = [letter for letter, _, _ in layout]
+    contig = ", /0, ".join([str(S["binder_length"])] + [f"{l}{numbers[0]}-{numbers[-1]}" for l, _, numbers in layout])
+    hot = {}
+    for h in S["hotspots"].split(","):
+        m = re.fullmatch(r"\s*([A-Za-z]+)(\d+)\s*", h)
+        if not m:
+            continue
+        where = [l for l, c, numbers in layout if c == m.group(1) and int(m.group(2)) in numbers]
+        if not where:
+            raise SystemExit(f"rfd4: hotspot {h.strip()} is not inside target_range {S['target_range']}")
+        hot.setdefault(where[0], []).append(m.group(2))
+    select = lambda text: "{select: " + q(text) + "}"
+    lines = ["design:",
+             f"  input: {q(str(Path(target_cif).resolve()))}",
+             f"  contig: {q(contig)}",
+             "  conditions:",
+             "    C_CRDGRP: {1: [" + select(f"sel('[{','.join(letters)}]/*/*/[N,CA,C,O]')") + "]}",
+             "    C_SEQ: {true: [" + ", ".join(select(f"sel('{l}')") for l in letters) + "]}",
+             "    C_HOT: {true: [" + ", ".join(select(f"sel('{l}/*/[{','.join(n)}]')") for l, n in hot.items()) + "]}"]
+    lines += [f"  {key}: {q(value)}" for key, value in S.get("rfd4_spec_extra", {}).items()]   # advanced: other input fields
+    return "\n".join(lines) + "\n"
+
+
+def convert_rfd4_output(generated_cif, pdb_out, layout):
+    """RFD4 writes <name>_generated.cif: the new binder chain plus the target pieces, each numbered from 1. Convert it to
+    the layout used here: target = chain A (pieces joined, ORIGINAL residue numbers back), binder = chain B (with the sequence
+    RFD4 designed), plus the small design_N.json side file saying which chain is which."""
+    from Bio.PDB.MMCIF2Dict import MMCIF2Dict
+    d = MMCIF2Dict(str(generated_cif))             # read the raw table: RFD4's file has no B-factor column, so MMCIFParser fails
+    rows = list(zip(d["_atom_site.auth_asym_id"], d["_atom_site.auth_seq_id"], d["_atom_site.label_comp_id"],
+                    d["_atom_site.label_atom_id"], d["_atom_site.Cartn_x"], d["_atom_site.Cartn_y"], d["_atom_site.Cartn_z"],
+                    d["_atom_site.type_symbol"]))
+    pieces = {letter: numbers for letter, _, numbers in layout}
+    binder = sorted({r[0] for r in rows} - set(pieces))
+    if len(binder) != 1 or set(pieces) - {r[0] for r in rows}:
+        raise ValueError(f"{Path(generated_cif).name}: expected target chains {sorted(pieces)} + one binder chain, "
+                         f"found {sorted({r[0] for r in rows})}")
+    lines, serial = [], 0
+    for new_chain, old_chains in (("A", list(pieces)), ("B", binder)):
+        for old in old_chains:
+            for chain, number, resname, atom, x, y, z, element in rows:
+                if chain != old:
+                    continue
+                if old in pieces:
+                    number = pieces[old][int(number) - 1]
+                serial += 1
+                name = f" {atom:<3}" if len(atom) < 4 and len(element) == 1 else f"{atom:<4}"
+                lines.append(f"ATOM  {serial:5d} {name} {resname:>3} {new_chain}{int(number):4d}    "
+                             f"{float(x):8.3f}{float(y):8.3f}{float(z):8.3f}  1.00  0.00          {element:>2}")
+        lines.append("TER")
+    Path(pdb_out).write_text("\n".join(lines) + "\nEND\n")
+    Path(pdb_out).with_suffix(".json").write_text(json.dumps(
+        {"binder_chain": "B", "target_chain": "A", "source": Path(generated_cif).parent.name}, indent=1))
+
+
+def step1_rfd4(S, out):
+    folder = fresh_backbone_folder(out)
+    raw = out / "1_rfd4_raw"                                   # RFD4's own files, one sub-folder per worker
+    raw.mkdir(parents=True, exist_ok=True)
+    layout = rfd4_target(S, raw)
+    spec_path = raw / "spec.yaml"
+    spec_path.write_text(rfd4_spec(S, layout, raw / "target.cif"))
+    workers = workers_for(S, "rfd4")
+    counts = [len(c) for c in split_by_weight(range(S["num_backbones"]), workers)]      # designs per worker
+    batch = max(1, int(S.get("rfd4_batch_size", 8)))           # designs made at once
+    commands, plan = [], []
+    for k, (w, count) in enumerate(zip(workers, counts)):
+        if not count:
+            continue
+        wdir = raw / f"w{k}"
+        # RFD4's default seed is fixed, so two workers would make the SAME designs: give each worker its own seed
+        cmd = w["cmd"] + [f"inputs={spec_path}", f"out_dir={wdir}", f"num_replicates={count}",
+                          f"batch_size={min(batch, count)}", f"seed={int(S.get('rfd4_seed', 1)) + 1000 * k}", "~metrics"]
+        if S.get("rfd4_ckpt"):
+            cmd.append(f"hf_ckpt_path={S['rfd4_ckpt']}")
+        if S.get("rfd4_revision"):
+            cmd.append(f"hf_ckpt_revision={S['rfd4_revision']}")        # pin the exact model version (the model card asks for it)
+        cmd += [str(x) for x in S.get("rfd4_overrides", [])]
+        commands.append((cmd, w.get("env")))
+        plan.append((wdir, count))
+    run_parallel(commands)
+    made = 0
+    for wdir, count in plan:
+        files = sorted((wdir / "inference_samples").glob("*/*_generated.cif"), key=natural_key)[:count]
+        if len(files) < count:
+            raise SystemExit(f"RFD4 wrote {len(files)} designs in {wdir}, expected {count}: see the messages above")
+        for f in files:
+            convert_rfd4_output(f, folder / f"design_{made}.pdb", layout)
+            made += 1
+    print(f"  -> {made} designs made (RFD4: backbone AND sequence)")
+    return sorted(folder.glob("design_*.pdb"))
+
+
+def step1_backbones(S, out):
+    tool = backbone_tool(S)
+    print(f"  backbone tool: {tool}")
+    return {"rfd3": step1_rfd3, "rfd4": step1_rfd4}.get(tool, step1_rfdiffusion)(S, out)
+
+
+def step1_rfdiffusion(S, out):
+    folder = fresh_backbone_folder(out)
     # "Contig" = RFdiffusion's recipe.  "A1-120/0 60-80" means:
     #   keep target residues A1-120 as they are, "/0" = start a new chain,
     #   then build a brand-new chain of 60-80 residues (the binder).
@@ -166,8 +591,10 @@ def read_mpnn_fasta(fasta, binder_length):
     for header, seq in records[1:]:
         parts = seq.split("/")
         # binder = the part with the binder's length that CHANGED compared to the input
-        # (the input binder is all Glycine, the target part never changes)
+        # (the target part never changes)
         candidates = [p for i, p in enumerate(parts) if len(p) == binder_length and p != native_parts[i]]
+        if not candidates:   # ProteinMPNN happened to reproduce the input sequence exactly
+            candidates = [p for p in parts if len(p) == binder_length]
         score = float(re.search(r"(?<!\w)score=([\d.]+)", header).group(1))  # ProteinMPNN score: lower = better
         found.append((candidates[0], score))
     return found
@@ -178,7 +605,7 @@ def design_sequences(S, worker, pdbs, folder):
     rows = []
     for pdb in pdbs:
         chains = read_chains(pdb)
-        binder, target = find_binder_and_target(chains)
+        binder, target = find_binder_and_target(chains, pdb)
         run(worker["cmd"] + [
             "--pdb_path", pdb.resolve(),
             "--pdb_path_chains", binder,                   # ONLY redesign the binder; target stays fixed
@@ -197,7 +624,25 @@ def design_sequences(S, worker, pdbs, folder):
     return rows
 
 
+def native_sequences(backbones, out):
+    """RFD4 designs the binder's sequence together with its structure: use that sequence as it is (no ProteinMPNN)."""
+    rows = []
+    for pdb in backbones:
+        chains = read_chains(pdb)
+        binder, target = find_binder_and_target(chains, pdb)
+        rows.append({"job": f"{pdb.stem}_native", "backbone": str(pdb.resolve()), "binder_chain": binder,
+                     "target_chain": target, "binder_seq": sequence_of(chains[binder]),
+                     "target_seq": sequence_of(chains[target]), "mpnn_score": ""})
+    rows.sort(key=lambda r: natural_key(r["job"]))
+    (out / "2_mpnn").mkdir(parents=True, exist_ok=True)
+    write_csv(out / "2_mpnn" / "sequences.csv", rows)
+    print(f"  -> {len(rows)} sequences taken from RFD4 (ProteinMPNN skipped; set \"rfd4_mpnn\": True to redesign them with it)")
+    return rows
+
+
 def step2_mpnn(S, backbones, out):
+    if backbone_tool(S) == "rfd4" and not S.get("rfd4_mpnn"):
+        return native_sequences(backbones, out)
     folder = out / "2_mpnn"
     workers = workers_for(S, "mpnn")
     shares = split_by_weight(backbones, workers)
@@ -275,6 +720,10 @@ def make_af2_pdb(job, out_path):
     for new_chain, old_chain in (("A", job["binder_chain"]), ("B", job["target_chain"])):
         seq, last_key, i = job["binder_seq"], None, -1
         for key, line in atoms[old_chain]:
+            # the binder gets a NEW sequence from ProteinMPNN, so keep only its backbone (RFD3 binders also carry side
+            # chains of the residues RFD3 chose, which would no longer match the new residue names)
+            if new_chain == "A" and line[12:16].strip() not in ("N", "CA", "C", "O"):
+                continue
             if key != last_key:                      # a new residue starts
                 number, i, last_key = number + 1, i + 1, key
             name = THREE[seq[i]] if new_chain == "A" else line[17:20]
@@ -415,7 +864,7 @@ def step4_score_af2(S, jobs, out):
 # ----------------------------------------------------------------------------
 def write_csv(path, rows):
     with open(path, "w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=list(rows[0]))
+        w = csv.DictWriter(f, fieldnames=list(dict.fromkeys(k for r in rows for k in r)), restval="")   # every column that appears
         w.writeheader()
         w.writerows(rows)
 
@@ -428,9 +877,11 @@ def read_csv(path):
 def main():
     ap = argparse.ArgumentParser(description="RFdiffusion -> ProteinMPNN -> AlphaFold2 (Bennett initial guess) binder design")
     ap.add_argument("--settings", default=str(Path(__file__).with_name("settings.py")))
-    ap.add_argument("--stages", default="rfd,mpnn,af2,score_af2",
-                    help="comma list of: rfd,mpnn,af2,score_af2  |  optional AlphaFold Server route: afs_export,afs_import,score_afs")
+    ap.add_argument("--stages", default="glyco,rfd,mpnn,af2,score_af2",
+                    help="comma list of: glyco (scan the target for N-glycosylation sites), rfd,mpnn,af2,score_af2  |  "
+                         "optional AlphaFold Server route: afs_export,afs_import,score_afs")
     ap.add_argument("--afserver_zips", help="folder with fold_*.zip downloaded from alphafoldserver.com")
+    ap.add_argument("--netnglyc_output", help="text output of NetNGlyc 1.0 for 0_glyco/target.fasta (stage glyco)")
     ap.add_argument("--output_dir", help="use this folder instead of the one in the settings file")
     args = ap.parse_args()
 
@@ -439,11 +890,14 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
     stages = args.stages.split(",")
 
+    if "glyco" in stages:
+        print("\n[0/4] Target glycosylation scan (N-X-S/T sequons)")
+        step0_glyco(S, out, args.netnglyc_output)
     if "rfd" in stages:
-        print("\n[1/4] RFdiffusion: designing backbones")
-        backbones = step1_rfdiffusion(S, out)
+        print("\n[1/4] Backbones (RFdiffusion 3 by default; RFD4 also designs the sequence): designing backbones")
+        backbones = step1_backbones(S, out)
     if "mpnn" in stages:
-        print("\n[2/4] ProteinMPNN: designing sequences")
+        print("\n[2/4] ProteinMPNN: designing sequences (with RFD4 the sequences already exist)")
         step2_mpnn(S, sorted((out / "1_rfdiffusion").glob("design_*.pdb")), out)
     jobs = read_csv(out / "2_mpnn" / "sequences.csv") if {"af2", "score_af2", "afs_export", "afs_import", "score_afs"} & set(stages) else []
     if "afs_export" in stages:
