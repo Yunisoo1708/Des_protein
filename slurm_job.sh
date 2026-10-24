@@ -29,7 +29,7 @@ BASE=/gscratch/scrubbed/legia8/binder                         # <-- EDIT: where 
 PROJECT=/gscratch/scrubbed/legia8/Protein_design_workflow     # <-- EDIT: the project folder
 RUN=$BASE/runs/trial_$(date +%Y%m%d_%H%M)                     # a NEW output folder for every run
 
-# --- the job description (read by settings_big_gpu.py) ---
+# --- the job description (read by settings.py) ---
 export TARGET_PDB=/gscratch/scrubbed/legia8/targets/5YXH.pdb  # <-- EDIT
 export TARGET_RANGE="A16-108,A113-151"                         # <-- EDIT (commas between pieces; every residue must exist in the PDB)
 export HOTSPOTS="A31,A123,A122,A32"                            # <-- EDIT
@@ -68,6 +68,6 @@ fi
 cd "$PROJECT"
 echo "output folder: $RUN"
 
-python design_pipeline.py --settings settings_big_gpu.py --output_dir "$RUN" --stages glyco,rfd,mpnn,af2,score_af2
+python design_pipeline.py --settings settings.py --output_dir "$RUN" --stages glyco,rfd,mpnn,af2,score_af2
 
 echo "finished $(date)"

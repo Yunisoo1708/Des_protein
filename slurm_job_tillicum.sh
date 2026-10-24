@@ -34,7 +34,7 @@ for p in "$BASE/envs" "$PROJECT/design_pipeline.py" "$TARGET"; do
     [ -e "$p" ] || { echo "ERROR: $p not found: edit the CHANGE_ME lines at the top of this script"; exit 1; }
 done
 
-# --- the job description (read by settings_big_gpu.py) ---
+# --- the job description (read by settings.py) ---
 export TARGET_PDB=$TARGET
 export TARGET_RANGE="A16-108,A113-151"       # <-- EDIT (commas between pieces; every residue must exist in the PDB)
 export HOTSPOTS="A31,A123,A122,A32"          # <-- EDIT
@@ -74,6 +74,6 @@ fi
 cd "$PROJECT"
 echo "output folder: $RUN"
 
-python design_pipeline.py --settings settings_big_gpu.py --output_dir "$RUN" --stages glyco,rfd,mpnn,af2,score_af2
+python design_pipeline.py --settings settings.py --output_dir "$RUN" --stages glyco,rfd,mpnn,af2,score_af2
 
 echo "finished $(date)"

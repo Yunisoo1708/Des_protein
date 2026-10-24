@@ -310,43 +310,88 @@ SETTINGS = S
     assert res.returncode != 0 and words in (res.stdout + res.stderr), (bad, res.stdout[-300:], res.stderr[-300:])
 print("Test 11 passed: RFD4 route (CIF with one chain per piece, spec, original numbering, native sequences, per-worker seeds)")
 
-# ---- Test 12: settings_dual_gpu.py builds the right workers for the two-card server -------------------------------------------
+# ---- Test 12: the single settings.py: cards, tool, AF2 environment, workers, batch sizes, shares ----------------------------
 import os                                                                      # noqa: E402
 import runpy                                                                   # noqa: E402
-from design_pipeline import split_by_weight                                    # noqa: E402
-env12 = {"TARGET_PDB": "t.pdb", "TARGET_RANGE": "A1-10", "HOTSPOTS": "A5", "NUM_BACKBONES": "24"}
-saved = {k: os.environ.get(k) for k in [*env12, "BACKBONE_TOOL", "RFD_WORKERS_1"]}
-try:
-    os.environ.update(env12)
-    for tool_name, expect_cards in (("rfd4", ["0"]), ("rfd3", ["0", "1"])):          # RFD4 leaves the 1660 SUPER out by default
-        os.environ["BACKBONE_TOOL"] = tool_name
-        S12 = runpy.run_path(str(HERE.parent / "settings_dual_gpu.py"))["SETTINGS"]
-        bb = workers_for(S12, f"{tool_name}_workers".replace("_workers", ""))
-        assert [w["env"]["CUDA_VISIBLE_DEVICES"] for w in bb] == expect_cards, (tool_name, bb)
-    os.environ.update(BACKBONE_TOOL="rfd4", RFD_WORKERS_1="1")                       # ... and a user can switch it on
-    S12 = runpy.run_path(str(HERE.parent / "settings_dual_gpu.py"))["SETTINGS"]
+from contextlib import contextmanager                                          # noqa: E402
+from design_pipeline import split_by_weight, backbone_tool                     # noqa: E402
+
+CONTROL = ["TARGET_PDB", "TARGET_RANGE", "HOTSPOTS", "NUM_BACKBONES", "GPUS", "GPU", "GPU_INFO", "BACKBONE_TOOL", "AF2_ENV",
+           "RFD_WORKERS", "RFD_WORKERS_0", "RFD_WORKERS_1", "AF2_WORKERS", "AF2_WORKERS_0", "AF2_WORKERS_1", "RFD4_BATCH",
+           "RFD3_BATCH", "RFD3_BATCH_1", "CUDA_VISIBLE_DEVICES", "RFD4_MPNN", "RFD4_SEED"]
+TWO_CARDS = "0:12.0:16311,1:7.5:6144"                                           # RTX 5060 Ti (Blackwell, 16 GB) + GTX 1660 SUPER (Turing, 6 GB)
+
+
+@contextmanager
+def settings_with(**env):
+    saved = {k: os.environ.get(k) for k in CONTROL}
+    try:
+        for k in CONTROL:
+            os.environ.pop(k, None)
+        os.environ.update({"TARGET_PDB": "t.pdb", "TARGET_RANGE": "A1-10", "HOTSPOTS": "A5", **env})
+        yield runpy.run_path(str(HERE.parent / "settings.py"))
+    finally:
+        for k, v in saved.items():
+            os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+
+
+cards = lambda ws: [w["env"]["CUDA_VISIBLE_DEVICES"] for w in ws]
+# two cards, defaults: RFD4 on the new card only, AF2 on both with the right environment, RFD3 on both
+with settings_with(GPUS="0,1", GPU_INFO=TWO_CARDS, NUM_BACKBONES="24") as ns:
+    S12 = ns["SETTINGS"]
+    assert S12["backbone_tool"] == "rfd4" and S12["num_backbones"] == 24
     bb = workers_for(S12, "rfd4")
-    assert [len(c) for c in split_by_weight(range(24), bb)] == [22, 2], "12 : 1 share of 24 designs"
-    assert bb[1]["batch"] == 2 and "precision=32-true" in bb[1]["cmd"] and "inference_experiment=quickstart" in bb[1]["cmd"]
-    assert bb[0]["batch"] == 8 and bb[0]["cmd"][0].endswith("rfd4-generate") and bb[0]["env"]["CUDA_VISIBLE_DEVICES"] == "0"
-    split24 = [len(c) for c in split_by_weight(range(24), [{"weight": 1}] * 6 + [{"weight": 0.7}] * 2)]
-    assert sum(split24) == 24 and max(split24[:6]) <= 4 and max(split24[6:]) <= 3, split24      # no leftover dumped on the last worker
-    assert sorted(len(c) for c in split_by_weight(range(7), [{"weight": 1}] * 3)) == [2, 2, 3]
+    assert cards(bb) == ["0"] and bb[0]["batch"] == 8 and bb[0]["cmd"][0].endswith("rfd4-generate")
+    r3 = workers_for(S12, "rfd3")
+    assert cards(r3) == ["0", "1"] and [w["batch"] for w in r3] == [4, 2] and [len(c) for c in split_by_weight(range(20), r3)] == [16, 4]
     af = workers_for(S12, "af2")
-    assert [w["env"]["CUDA_VISIBLE_DEVICES"] for w in af] == ["0"] * 4 + ["1"] * 2
+    assert cards(af) == ["0"] * 6 + ["1"] * 2, "6 AF2 workers on the first card, 2 on the second"
     assert "af2_bw" in af[0]["cmd"][0] and "af2_bd" in af[-1]["cmd"][0], "Blackwell card needs the newer-JAX environment"
     assert all(w["env"]["XLA_PYTHON_CLIENT_PREALLOCATE"] == "false" for w in af)
-finally:
-    for k, v in saved.items():
-        os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
-# RFD4 is the default tool; cards older than Ampere (compute capability < 8) fall back to RFD3
-os.environ["TARGET_PDB"], os.environ["TARGET_RANGE"], os.environ["HOTSPOTS"] = "t.pdb", "A1-10", "A5"
-os.environ.pop("BACKBONE_TOOL", None)
-ns12 = runpy.run_path(str(HERE.parent / "settings_big_gpu.py"))
-assert ns12["pick_default_tool"](None) == "rfd4" and ns12["pick_default_tool"](8.9) == "rfd4" and ns12["pick_default_tool"](12.0) == "rfd4"
-assert ns12["pick_default_tool"](7.5) == "rfd3", "GTX 1660 SUPER (7.5) cannot run RFD4"
-from design_pipeline import backbone_tool                                     # noqa: E402
+    assert af[0]["env"]["JAX_COMPILATION_CACHE_DIR"] != af[-1]["env"]["JAX_COMPILATION_CACHE_DIR"], "one JAX cache per environment"
+    assert cards(workers_for(S12, "mpnn")) == ["0", "1"]
+# a user can switch RFD4 on for the old card (per-card variable only): slow fp32, 12 : 1 share, small batch
+with settings_with(GPUS="0,1", GPU_INFO=TWO_CARDS, RFD_WORKERS_1="1") as ns:
+    bb = workers_for(ns["SETTINGS"], "rfd4")
+    assert cards(bb) == ["0", "1"] and [len(c) for c in split_by_weight(range(24), bb)] == [22, 2]
+    assert bb[1]["batch"] == 2 and "precision=32-true" in bb[1]["cmd"] and "inference_experiment=quickstart" in bb[1]["cmd"]
+with settings_with(GPUS="0,1", GPU_INFO=TWO_CARDS, RFD_WORKERS="1") as ns:
+    assert cards(workers_for(ns["SETTINGS"], "rfd4")) == ["0"], "a global RFD_WORKERS must not put RFD4 on a card that cannot run it"
+# one card at a time: GPU 0 -> RFD4 + af2_bw + 8 AF2 workers; GPU 1 (compute capability 7.5) -> falls back to RFD3 + af2_bd
+with settings_with(GPUS="0", GPU_INFO=TWO_CARDS) as ns:
+    assert ns["SETTINGS"]["backbone_tool"] == "rfd4" and len(workers_for(ns["SETTINGS"], "af2")) == 8
+with settings_with(GPUS="1", GPU_INFO=TWO_CARDS) as ns:
+    assert ns["SETTINGS"]["backbone_tool"] == "rfd3", "GTX 1660 SUPER (7.5) cannot run RFD4"
+    assert "af2_bd" in workers_for(ns["SETTINGS"], "af2")[0]["cmd"][0]
+with settings_with(GPUS="1", GPU_INFO=TWO_CARDS, BACKBONE_TOOL="rfd4") as ns:               # forced
+    bb = workers_for(ns["SETTINGS"], "rfd4")
+    assert ns["SETTINGS"]["backbone_tool"] == "rfd4" and cards(bb) == ["1"] and "precision=32-true" in bb[0]["cmd"]
+with settings_with(GPUS="0", GPU_INFO="0:12.0:16311", AF2_ENV="af2_bd") as ns:                # AF2_ENV forces one environment
+    assert "af2_bd" in workers_for(ns["SETTINGS"], "af2")[0]["cmd"][0]
+with settings_with(GPU="1", GPU_INFO=TWO_CARDS) as ns:                                        # the old variable name still works
+    assert cards(workers_for(ns["SETTINGS"], "af2")) == ["1"] * 8
+with settings_with(CUDA_VISIBLE_DEVICES="1", GPU_INFO=TWO_CARDS) as ns:                       # a cluster job sets this for you
+    assert ns["SETTINGS"]["backbone_tool"] == "rfd3"
+# the target is needed only by the stages that read it: designing/scanning refuses without it, re-scoring does not
+env_no_target = {k: v for k, v in os.environ.items() if k not in CONTROL}
+for stage in ("rfd", "glyco"):
+    res = subprocess.run([sys.executable, PIPELINE, "--settings", str(HERE.parent / "settings.py"), "--output_dir",
+                          str(work / "run_no_target"), "--stages", stage], capture_output=True, text=True, env=env_no_target)
+    assert res.returncode != 0 and "The target is not set" in (res.stdout + res.stderr) and "TARGET_PDB" in (res.stdout + res.stderr)
+res = subprocess.run([sys.executable, PIPELINE, "--settings", str(HERE.parent / "settings.py"), "--output_dir", str(r4),
+                      "--stages", "score_af2"], capture_output=True, text=True, env={**env_no_target, "GPU_INFO": TWO_CARDS})
+assert res.returncode == 0 and len(read_csv(r4 / "results_af2.csv")) == 3, res.stderr[-400:]
+# a target given in the environment is used
+res = subprocess.run([sys.executable, "-c", "import runpy; S = runpy.run_path(r'%s')['SETTINGS']; print(S['target_pdb'], S['target_range'], S['hotspots'])"
+                      % (HERE.parent / "settings.py")], capture_output=True, text=True,
+                     env={**env_no_target, "GPU_INFO": TWO_CARDS, "TARGET_PDB": "x.pdb", "TARGET_RANGE": "A1-5", "HOTSPOTS": "A2"})
+assert res.stdout.split() == ["x.pdb", "A1-5", "A2"], res.stderr[-300:]
+# leftovers are shared out by fractional share, not dumped on the last worker
+split24 = [len(c) for c in split_by_weight(range(24), [{"weight": 1}] * 6 + [{"weight": 0.7}] * 2)]
+assert sum(split24) == 24 and max(split24[:6]) <= 4 and max(split24[6:]) <= 3, split24
+assert sorted(len(c) for c in split_by_weight(range(7), [{"weight": 1}] * 3)) == [2, 2, 3]
+# when the settings do not name a tool, the pipeline tries RFD4, then RFD3, then RFdiffusion 1
 assert backbone_tool({"rfd4_cmd": ["x"], "rfd3_cmd": ["y"]}) == "rfd4" and backbone_tool({"rfd3_cmd": ["y"]}) == "rfd3"
 assert backbone_tool({"backbone_tool": "rfd3", "rfd4_cmd": ["x"]}) == "rfd3", "an explicit setting always wins"
-print("Test 12 passed: dual-GPU settings (RFD4 on the big card only, RFD3 on both, AF2 environment per card, 12:1 / 4:1 shares)")
+print("Test 12 passed: settings.py (cards, tool, AF2 environment per card, workers, batch sizes, shares, required target)")
 print("\nALL TESTS PASSED")

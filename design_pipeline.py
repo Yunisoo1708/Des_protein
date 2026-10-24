@@ -903,9 +903,14 @@ def main():
     args = ap.parse_args()
 
     S = runpy.run_path(args.settings)["SETTINGS"]           # load the settings dictionary
+    stages = args.stages.split(",")
+    missing = [name for key, name in (("target_pdb", "TARGET_PDB"), ("target_range", "TARGET_RANGE"), ("hotspots", "HOTSPOTS"))
+               if not S.get(key)]
+    if missing and {"glyco", "rfd"} & set(stages):          # only the stages that read the target need it (re-scoring does not)
+        raise SystemExit(f"The target is not set: {', '.join(missing)}. Fill in the YOUR JOB block at the top of settings.py, or run  "
+                         f"{missing[0]}=...  python design_pipeline.py ...")
     out = Path(args.output_dir or S["output_dir"]).resolve()
     out.mkdir(parents=True, exist_ok=True)
-    stages = args.stages.split(",")
 
     if "glyco" in stages:
         print("\n[0/4] Target glycosylation scan (N-X-S/T sequons)")
