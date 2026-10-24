@@ -1,5 +1,0 @@
-chain,residue,motif,in_target_range,sasa,rsa,exposed,nearest_hotspot,hotspot_dist_A,reglyco_accessible,reglyco_joint,reglyco_steric_score,support,verdict,warning
-A,11,NLT,True,98.7,0.66,True,A59,13.4,True,True,1.0,2/2,likely,within 15 A of hotspot A59: a glycan here could block the binder
-A,20,NCS,True,83.6,0.56,True,A59,23.6,True,True,1.0,2/2,likely,
-A,73,NLT,True,53.9,0.36,True,A59,20.6,True,True,1.0,2/2,likely,
-A,106,NIT,True,40.0,0.27,True,A83,17.2,True,True,1.0,2/2,likely,

@@ -10,7 +10,7 @@ target.pdb ─► [1 RFD4-Proteina] ─► binders (backbone + sequence) ─► 
 target.pdb ─► [1 RFdiffusion 3] ─► backbones ─► [2 ProteinMPNN] ─► sequences ─► [3 AF2 initial guess] ─► [4 Score] ─► results_af2.csv
 ```
 
-New here? Read [GUIDE.md](GUIDE.md): the run command, a map of the code, and a "how do I change X" cheat sheet.
+The whole program is `design_pipeline.py` (the workflow) and `settings.py` (your job + the GPU logic); `install_envs.sh` installs the tools once, and `slurm_job.sh` / `slurm_job_tillicum.sh` run it on a cluster. Open `main()` in `design_pipeline.py` first: it runs the stages in order.
 
 ## Use it
 1. Install the tools (once) with `install_envs.sh`, one step at a time: `tools`, `weights`, `rfd3_env`, `af2_env`, `rfd4_env`, `check`
@@ -57,8 +57,7 @@ Output: `0_glyco/glyco_sites.csv` with one row per motif: `exposed`, `reglyco_ac
 - **What the pipeline does for you:** RFD4 only reads CIF and will not bond across a gap in the target, so the pipeline writes `1_rfd4_raw/target.cif` with **every piece of `target_range` as its own chain** (`A16-108,A113-151` becomes chains A and B, original residue numbers kept), writes `spec.yaml` (contig, target backbone + sequence, hotspots), then converts each result to the usual `design_N.pdb` (target = chain A with the original numbers, binder = chain B). Each worker gets its own `seed` (RFD4's default seed is fixed, so two workers would repeat each other).
 - **`target_range` must be kept pieces only** (`A16-108,A113-151`); a bare number that designs new residues in a gap (`A16-108,4,A113-151`) is not supported with RFD4, and every residue in the range must exist in the PDB file.
 - The first run compiles the model (about 4 minutes for batch 8); later runs reuse the cache. `cuEquivariance` kernels are not installed, which RFD4 only warns about.
-- **Measured on 5YXH** (RTX 5060 Ti, 55-residue binder, 24 designs, one run each, so treat small differences as noise): generation took 237 s with RFD4 (batch 8, 5.4 GB) and 273 s with RFD3 (batch 8, 6.2 GB), i.e. about the same speed (NVIDIA's blog claims a much bigger gap). AF2 pass rate (pAE ≤ 10, pLDDT ≥ 80, RMSD ≤ 2): **RFD4 3/24 and 2/24 in two runs with its own sequences, 9/96 with ProteinMPNN sequences; RFD3 + ProteinMPNN 0/96** (also 0/96 in an earlier run). See `real_run/timing_rfd3_vs_rfd4_rtx5060ti.txt`.
-- **Second target** (insulin receptor L1 domain from RFdiffusion's examples, `A1-150`, hotspots `A59,A83,A91`, 24 designs per tool, one run each): **RFD4 12/24 pass with its own sequences (50%) and 46/96 with ProteinMPNN sequences; RFD3 7/96 (from only 2 backbones); RFdiffusion 1 27/200 in an earlier run.** So RFD3 does work here, and RFD4 still passes about 4-7x more often. Two targets and single runs: promising, not proof; see `real_run/comparison_rfd4_vs_rfd3_two_targets.txt`.
+- **Measured on 5YXH** (RTX 5060 Ti, 55-residue binder, 24 designs, one run each, so treat small differences as noise): generation took 237 s with RFD4 (batch 8, 5.4 GB) and 273 s with RFD3 (batch 8, 6.2 GB), i.e. about the same speed (NVIDIA's blog claims a much bigger gap). AF2 pass rate (pAE ≤ 10, pLDDT ≥ 80, RMSD ≤ 2): **RFD4 3/24 and 2/24 in two runs with its own sequences, 9/96 with ProteinMPNN sequences; RFD3 + ProteinMPNN 0/96** (also 0/96 in an earlier run).- **Second target** (insulin receptor L1 domain from RFdiffusion's examples, `A1-150`, hotspots `A59,A83,A91`, 24 designs per tool, one run each): **RFD4 12/24 pass with its own sequences (50%) and 46/96 with ProteinMPNN sequences; RFD3 7/96 (from only 2 backbones); RFdiffusion 1 27/200 in an earlier run.** So RFD3 does work here, and RFD4 still passes about 4-7x more often. Two targets and single runs: promising, not proof.
 - AF2 on an **RTX 50xx (Blackwell)** card needs the newer-JAX environment: `AF2_ENV=af2_bw` (the default `af2_bd` crashes there with a `ptxas` error).
 
 ## Optional: iPTM from AlphaFold Server (website)
@@ -80,7 +79,7 @@ shared between them, running at the same time; `settings.py` builds these lists 
 AF2 is limited by the CPU (about 16 s of every 20 s per prediction is PyRosetta / TensorFlow / file writing on one
 core), not the GPU, so the way to speed it up is *more workers per card*, not a faster card. Measured: 200 AF2
 predictions took 51 min with 1 worker per card and **20.6 min with 4 workers on the 5060 Ti + 2 on the 1660 SUPER**
-(`real_run/timing_af2_6workers.txt`). AF2 is not exactly repeatable: the two runs gave the same scores to ~0.1
+(measured on the dev server). AF2 is not exactly repeatable: the two runs gave the same scores to ~0.1
 (median), but 5 of 200 designs flipped pass/fail, mostly designs sitting right on the RMSD limit.
 `--output_dir` re-runs a stage into a different folder without touching earlier results.
 
@@ -88,7 +87,7 @@ predictions took 51 min with 1 worker per card and **20.6 min with 4 workers on 
 - **AF2, 96 predictions:** 584 s with 6 workers on the 5060 Ti alone, **510 s with 6 on the 5060 Ti + 2 on the 1660 SUPER** (1.15x). Identical pass set (9 of 96) and pAE within 0.06 between the cards. The gain is small because AF2 is CPU-bound (16 cores) and the 1660's workers are slower (about 0.7x per worker, and they start about 75 s later). With only 24 predictions the dual setup was *slower* (the 1660 workers' start-up dominates), so use it for big batches.
 - **RFD3:** about 4x slower per design on the 1660 SUPER (47 s vs 11.4 s), so it gets a 4 : 1 share.
 - **RFD4: leave the 1660 SUPER out** (the default). It cannot run RFD4's default bf16 attention (error `Invalid backend`), so it needs `precision=32-true` and no compile, and then needs about 125 s per design against 9.9 s on the 5060 Ti. Adding it (`RFD_WORKERS_1=1`, the per-card variable) made the 24-design run no faster: 22 designs on the 5060 Ti are split 8+8+6, and the odd batch of 6 forces a recompile, so choose `NUM_BACKBONES` as a multiple of `RFD4_BATCH`.
-- **Whole pipeline, 24 RFD4 designs:** 432 s on the 5060 Ti alone vs 539 s dual (cold AF2 cache on the 1660 and the odd batch); see `real_run/timing_dual_gpu_rfd4.txt`.
+- **Whole pipeline, 24 RFD4 designs:** 432 s on the 5060 Ti alone vs 539 s dual (cold AF2 cache on the 1660 and the odd batch).
 
 **How many workers per GPU?** Set them per run, e.g. `AF2_WORKERS=16 python design_pipeline.py ...` (every card) or `AF2_WORKERS_1=2` (card 1 only); the same for `RFD_WORKERS` and `MPNN_WORKERS`. (Under the hood a worker with `"copies": N` runs N identical processes on one card and JAX's memory grab is switched off automatically.)
 The defaults (8 AF2 workers on one card; 6 + 2 on two cards) were measured on the dev server only: on a new machine time 4, 8 and 16 AF2 workers and keep the fastest.
@@ -98,5 +97,4 @@ The defaults (8 AF2 workers on one card; 6 + 2 on two cards) were measured on th
 - Start small (`num_backbones: 4`) and look at the table before scaling up. Four designs are far too few to judge a target: in a 4-design RFD3 trial on 5YXH none passed, which says little either way.
 - Passing means the design is self-consistent in silico, not that it binds in the lab.
 
-## Test it (no GPU, no tools needed)
-`python tests/test_workflow.py` runs the whole pipeline with fake tools (`tests/fake_tools.py`) that copy the real tools' command lines and output formats (including RFD3's `.cif.gz` + `.json` layout). It checks the commands, file parsing, the RFD3 conversion, the multi-worker splitting and the pAE/iPTM/pLDDT/RMSD maths. It does **not** judge design quality.
+(The self-test suite with fake tools used to live in `tests/`; it was removed from the repo to keep it minimal, but it is still in the git history, e.g. `git checkout 221fd85 -- tests`.)
