@@ -40,12 +40,6 @@ tools)
     ;;
 
 weights)
-    if [ "$WITH_RFD1" = 1 ]; then
-        mkdir -p "$TOOLS/RFdiffusion/models"
-        cd "$TOOLS/RFdiffusion/models"
-        wget -nv -c http://files.ipd.uw.edu/pub/RFdiffusion/6f5902ac237024bdd0c176cb93063dc4/Base_ckpt.pt
-        wget -nv -c http://files.ipd.uw.edu/pub/RFdiffusion/e29311f6f1bf1af907f9ef9f44b8328b/Complex_base_ckpt.pt
-    fi
     # AF2 weights: only params_model_1_ptm.npz is used (public, CC BY 4.0)
     mkdir -p "$TOOLS/dl_binder_design/af2_initial_guess/model_weights/params"
     cd "$TOOLS/dl_binder_design/af2_initial_guess/model_weights/params"
@@ -79,7 +73,9 @@ rfd4_env)
     "$ENVS/rfd4_env/bin/python" -m pip install rfd4-proteina
     # weights (~1.7 GB) go to the Hugging Face cache; do this on a machine WITH internet (compute nodes often have none)
     # they go to $BASE/hf_cache, which the Slurm scripts also use (HF_HOME): re-use it with  export HF_HOME=$BASE/hf_cache
-    HF_HOME=${HF_HOME:-$BASE/hf_cache} "$ENVS/rfd4_env/bin/python" -c "from huggingface_hub import snapshot_download; print(snapshot_download('nvidia/RFD4-Proteina'))"
+    # Only model.safetensors + config.json are fetched: the whole repo is ~84 GB (OpenFold3 images/weights, AF2, benchmarks)
+    # and is not needed for generation.
+    HF_HOME=${HF_HOME:-$BASE/hf_cache} "$ENVS/rfd4_env/bin/python" -c "from huggingface_hub import snapshot_download; print(snapshot_download('nvidia/RFD4-Proteina', allow_patterns=['config.json', 'model.safetensors']))"
     echo "Weights are in ${HF_HOME:-$BASE/hf_cache}. The pipeline uses RFD4 by default on Ampere or newer cards (RFD4_BIN=$ENVS/rfd4_env/bin/rfd4-generate if ENVS_DIR is not $ENVS)."
     ;;
 
@@ -121,8 +117,14 @@ af2_env)
     PY=$ENVS/af2_bd/bin/python
     $PY -m pip install "numpy<2" "tensorflow-cpu==2.15.1" dm-haiku dm-tree absl-py scipy
     # exact versions that work together (newer haiku / biopython / numpy break the AF2 code):
-    $PY -m pip install "numpy<2" "jax[cuda12_pip]==0.4.20" "jaxlib==0.4.20+cuda12.cudnn89" \
+    # JAX 0.4.23 (not 0.4.20): 0.4.20 failed on an RTX 4060 under WSL with "Failed to load PTX text as a module".
+    # 0.4.24 and newer cannot be used: they removed jax.linear_util, which dm-haiku 0.0.10 needs.
+    $PY -m pip install "numpy<2" "jax[cuda12_pip]==0.4.23" "jaxlib==0.4.23+cuda12.cudnn89" \
         -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
+    # jaxlib above is built for cuDNN 8.9; pip would otherwise pick cuDNN 9, and JAX then falls back to the CPU
+    # ("Found cuDNN version 0, but JAX was built against version 8904")
+    # ptxas from CUDA 12.2 (the version jaxlib was built with); settings.py points XLA at it (XLA_FLAGS, PATH)
+    $PY -m pip install "nvidia-cudnn-cu12==8.9.7.29" "nvidia-cuda-nvcc-cu12==12.2.140"
     $PY -m pip install --no-deps "dm-haiku==0.0.10" "biopython==1.81"
     $PY -m pip install "ml_dtypes<0.3" "numpy<2"
     ;;

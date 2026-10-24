@@ -21,13 +21,15 @@
 #SBATCH --job-name=binder
 #SBATCH --output=slurm-%j.out
 # <-- EDIT only if sbatch complains about the account (find yours with:  hyakusage ) -- remove one # and fill in:
-##SBATCH --account=YOUR_ACCOUNT
+##SBATCH --account=legia8
 
 set -eo pipefail      # (no "-u": conda's activation scripts use variables that may be unset)
+# if anything fails, the log says which line and which command (the log file is slurm-<jobnumber>.out, next to where you ran sbatch)
+trap 'echo "ERROR: the job stopped at line $LINENO of this script, in the command: $BASH_COMMAND" >&2' ERR
 
-BASE=CHANGE_ME_TO_YOUR_BIG_FOLDER      # <-- EDIT: where install_envs.sh put envs/ and tools/ on Tillicum
-PROJECT=CHANGE_ME_TO_THE_PROJECT       # <-- EDIT: the project folder (contains design_pipeline.py)
-TARGET=CHANGE_ME_TO_THE_PDB            # <-- EDIT: full path of your target PDB, e.g. .../targets/5YXH.pdb
+BASE=/gpfs/projects/stf/legia8/conda_env                        # <-- EDIT: where install_envs.sh put envs/ and tools/ on Tillicum
+PROJECT=/gpfs/projects/stf/legia8/Protein_design_workflow       # <-- EDIT: the project folder (contains design_pipeline.py)
+TARGET=/gpfs/projects/stf/legia8/Protein_design_workflow/prepared_protein_structure/5YXH.pdb   # <-- EDIT: full path of the PDB FILE
 RUN=$BASE/runs/trial_$(date +%Y%m%d_%H%M)    # a NEW output folder for every run
 
 for p in "$BASE/envs" "$PROJECT/design_pipeline.py" "$TARGET"; do
@@ -36,11 +38,11 @@ done
 
 # --- the job description (read by settings.py) ---
 export TARGET_PDB=$TARGET
-export TARGET_RANGE="A16-108,A113-151"       # <-- EDIT (commas between pieces; every residue must exist in the PDB)
-export HOTSPOTS="A31,A123,A122,A32"          # <-- EDIT
-export BINDER_LENGTH="55-55"
-export NUM_BACKBONES=4                       # a small trial first!
-export SEQS_PER_BACKBONE=2
+export TARGET_RANGE="A1-9,A280-309"       # <-- EDIT (commas between pieces; every residue must exist in the PDB)
+export HOTSPOTS="A1,A2,A6,A9,A280,A285,A288,A291,A294,A301,A308,A309"          # <-- EDIT
+export BINDER_LENGTH="60-80"
+export NUM_BACKBONES=5                       # a small trial first!
+export SEQS_PER_BACKBONE=5
 export AF2_WORKERS=6                         # 8 cores per H200: 6 AF2 workers leave room for the rest
 export RFD_WORKERS=1                         # RFD4: ONE worker with a big batch (each extra worker compiles the model again and takes more GPU memory)
 # Backbones: RFD4-Proteina is the default (needs: bash install_envs.sh rfd4_env). For RFD3 + ProteinMPNN use: export BACKBONE_TOOL=rfd3
@@ -73,6 +75,19 @@ fi
 
 cd "$PROJECT"
 echo "output folder: $RUN"
+echo "log file: slurm-${SLURM_JOB_ID}.out"
+scontrol show job "$SLURM_JOB_ID" 2>/dev/null | grep -oE "(JobState|QOS|TimeLimit|Partition|TresPerNode)=[^ ]+" | tr '\n' ' '; echo
+
+# --- settings check: what settings.py decided from the variables above (a wrong target or card shows up here) ---
+python - <<'PY'
+import os, runpy
+S = runpy.run_path("settings.py")["SETTINGS"]
+print("settings: tool =", S["backbone_tool"], "| target =", S["target_pdb"], S["target_range"], "| hotspots =", S["hotspots"],
+      "| designs =", S["num_backbones"])
+for key in ("rfd4_workers", "rfd3_workers", "af2_workers"):
+    if key.startswith(S["backbone_tool"]) or key == "af2_workers":
+        print("  ", key, [(w["env"]["CUDA_VISIBLE_DEVICES"], "x%d" % w["copies"], os.path.basename(os.path.dirname(os.path.dirname(w["cmd"][0])))) for w in S[key]])
+PY
 
 python design_pipeline.py --settings settings.py --output_dir "$RUN" --stages glyco,rfd,mpnn,af2,score_af2
 

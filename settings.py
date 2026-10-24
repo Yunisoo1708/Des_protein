@@ -166,6 +166,15 @@ def backbone_workers(tool):
     return workers
 
 
+def ptxas_env(env_name):
+    """JAX 0.4.23 in af2_bd needs to be told where ptxas is (pip package nvidia-cuda-nvcc-cu12), else
+    "XLA requires ptxas version 11.8 or higher". Nothing is added if the env has no such folder."""
+    for nvcc in sorted((ENVS / env_name / "lib").glob("python3*/site-packages/nvidia/cuda_nvcc")):
+        if (nvcc / "bin/ptxas").exists():
+            return {"XLA_FLAGS": f"--xla_gpu_cuda_data_dir={nvcc}", "PATH": f"{nvcc / 'bin'}:{os.environ.get('PATH', '')}"}
+    return {}
+
+
 def af2_workers():
     workers = []
     for i, g in enumerate(GPUS):
@@ -174,7 +183,7 @@ def af2_workers():
         n = int(per_card("AF2_WORKERS", g, default_n))
         if n >= 1:      # weight = the card's speed per worker (older cards ~0.7x); AF2 is CPU-bound, so more workers = more throughput
             workers.append(make_workers(ENVS / env_name / "bin/python", TOOLS / "dl_binder_design/af2_initial_guess/predict.py", g, n,
-                                        1.0 if modern(g) else 0.7, extra_env=cache(env_name)))
+                                        1.0 if modern(g) else 0.7, extra_env={**cache(env_name), **ptxas_env(env_name)}))
     return workers
 
 

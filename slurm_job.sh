@@ -24,6 +24,8 @@
 #SBATCH --output=slurm-%j.out
 
 set -eo pipefail      # (no "-u": conda's activation scripts use variables that may be unset)
+# if anything fails, the log says which line and which command (the log file is slurm-<jobnumber>.out, next to where you ran sbatch)
+trap 'echo "ERROR: the job stopped at line $LINENO of this script, in the command: $BASH_COMMAND" >&2' ERR
 
 BASE=/gscratch/scrubbed/legia8/binder                         # <-- EDIT: where install_envs.sh put things
 PROJECT=/gscratch/scrubbed/legia8/Protein_design_workflow     # <-- EDIT: the project folder
@@ -67,6 +69,19 @@ fi
 
 cd "$PROJECT"
 echo "output folder: $RUN"
+echo "log file: slurm-${SLURM_JOB_ID}.out"
+scontrol show job "$SLURM_JOB_ID" 2>/dev/null | grep -oE "(JobState|QOS|TimeLimit|Partition|TresPerNode)=[^ ]+" | tr '\n' ' '; echo
+
+# --- settings check: what settings.py decided from the variables above (a wrong target or card shows up here) ---
+python - <<'PY'
+import os, runpy
+S = runpy.run_path("settings.py")["SETTINGS"]
+print("settings: tool =", S["backbone_tool"], "| target =", S["target_pdb"], S["target_range"], "| hotspots =", S["hotspots"],
+      "| designs =", S["num_backbones"])
+for key in ("rfd4_workers", "rfd3_workers", "af2_workers"):
+    if key.startswith(S["backbone_tool"]) or key == "af2_workers":
+        print("  ", key, [(w["env"]["CUDA_VISIBLE_DEVICES"], "x%d" % w["copies"], os.path.basename(os.path.dirname(os.path.dirname(w["cmd"][0])))) for w in S[key]])
+PY
 
 python design_pipeline.py --settings settings.py --output_dir "$RUN" --stages glyco,rfd,mpnn,af2,score_af2
 
