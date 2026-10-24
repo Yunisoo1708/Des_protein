@@ -219,7 +219,11 @@ assert [r["support"] for r in rows10] == ["3/3", "1/3"] and [r["verdict"] for r 
 assert (work / "glyco_run_d" / "0_glyco" / "reglyco_scan" / "scan.json").exists()
 rows10b = step0_glyco({**S9, "reglyco_cmd": FAKE}, work / "glyco_run_e")               # ReGlyco alone (no NetNGlyc)
 assert [r["support"] for r in rows10b] == ["2/2", "1/2"]
-print("Test 10 passed: ReGlyco scan results merged with exposure and NetNGlyc into one verdict")
+broken = [sys.executable, "-c", "import sys; sys.exit(3)"]                               # ReGlyco that fails (e.g. no internet)
+rows10c = step0_glyco({**S9, "reglyco_cmd": broken}, work / "glyco_run_f")
+assert all(r["verdict"].startswith("candidate") for r in rows10c) and "reglyco_accessible" not in rows10c[0], \
+    "a failing ReGlyco must not stop the pipeline: the built-in scan still gives its table"
+print("Test 10 passed: ReGlyco scan results merged with exposure and NetNGlyc into one verdict; a failing ReGlyco is skipped")
 
 # ---- Test 11: RFD4-Proteina route (fake rfd4-generate): target -> CIF with one chain per piece, spec, convert, native sequences ----
 # Same gap as Test 6 (A21-A24 left out). RFD4 refuses to bond across a gap, so each piece becomes its own chain (A, B) and the

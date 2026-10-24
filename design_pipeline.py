@@ -234,8 +234,15 @@ def step0_glyco(S, out, netnglyc_output=None):
 
     predictors = {"structure (solvent exposure)": True}
     # --- optional: ReGlyco scan (automatic) ---
+    reglyco = None
     if S.get("reglyco_cmd"):
-        reglyco = reglyco_scan(S, folder)
+        try:
+            reglyco = reglyco_scan(S, folder)
+        except (subprocess.CalledProcessError, OSError, ValueError) as error:       # e.g. no internet on a compute node
+            print(f"  ! ReGlyco failed ({error}); continuing with the built-in scan only. It downloads glycan data from "
+                  f"glycoshape.org the first time: run `--stages glyco` once on a machine with internet, then set "
+                  f"\"reglyco_offline\" (REGLYCO_OFFLINE=1) for jobs on machines without it.")
+    if reglyco is not None:
         for r in rows:
             r.update(reglyco.get((r["chain"], r["residue"]), {"reglyco_accessible": "", "reglyco_joint": "", "reglyco_steric_score": ""}))
         extra = sorted(n for c, n in reglyco if c == chain_id and n not in {r["residue"] for r in rows})

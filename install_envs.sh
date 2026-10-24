@@ -78,8 +78,9 @@ rfd4_env)
     "$ENVS/rfd4_env/bin/python" -m pip install --upgrade pip
     "$ENVS/rfd4_env/bin/python" -m pip install rfd4-proteina
     # weights (~1.7 GB) go to the Hugging Face cache; do this on a machine WITH internet (compute nodes often have none)
-    "$ENVS/rfd4_env/bin/python" -c "from huggingface_hub import snapshot_download; print(snapshot_download('nvidia/RFD4-Proteina'))"
-    echo "Run the pipeline with  BACKBONE_TOOL=rfd4  (RFD4_BIN=$ENVS/rfd4_env/bin/rfd4-generate if ENVS_DIR is not $ENVS)."
+    # they go to $BASE/hf_cache, which the Slurm scripts also use (HF_HOME): re-use it with  export HF_HOME=$BASE/hf_cache
+    HF_HOME=${HF_HOME:-$BASE/hf_cache} "$ENVS/rfd4_env/bin/python" -c "from huggingface_hub import snapshot_download; print(snapshot_download('nvidia/RFD4-Proteina'))"
+    echo "Weights are in ${HF_HOME:-$BASE/hf_cache}. The pipeline uses RFD4 by default on Ampere or newer cards (RFD4_BIN=$ENVS/rfd4_env/bin/rfd4-generate if ENVS_DIR is not $ENVS)."
     ;;
 
 reglyco)
