@@ -1,14 +1,19 @@
-# Binder design: RFdiffusion 3 → ProteinMPNN → AlphaFold2 (Bennett "initial guess")
+# Binder design: RFD4-Proteina → AlphaFold2 (Bennett "initial guess")
 
 ```
+target.pdb ─► [1 RFD4-Proteina] ─► binders (backbone + sequence) ─► [3 AF2 initial guess] ─► [4 Score] ─► results_af2.csv
+              designs both together                                  predict binder+target    pAE_interaction, pLDDT, RMSD
+```
+**RFD4-Proteina is the default.** On a card older than Ampere (e.g. GTX 1660 SUPER) `settings_big_gpu.py` falls back to the older route
+`RFdiffusion 3 → ProteinMPNN → AF2`, or choose it with `BACKBONE_TOOL=rfd3` (see "RFdiffusion 3 notes" below):
+```
 target.pdb ─► [1 RFdiffusion 3] ─► backbones ─► [2 ProteinMPNN] ─► sequences ─► [3 AF2 initial guess] ─► [4 Score] ─► results_af2.csv
-              draw backbones                    write sequences                 predict binder+target    pAE_interaction, pLDDT, RMSD
 ```
 
 New here? Read [GUIDE.md](GUIDE.md): the run command, a map of the code, and a "how do I change X" cheat sheet.
 
 ## Use it
-1. Install the tools (once) with `install_envs.sh`, one step at a time: `tools`, `weights`, `rfd3_env`, `af2_env`, `check`
+1. Install the tools (once) with `install_envs.sh`, one step at a time: `tools`, `weights`, `rfd3_env`, `af2_env`, `rfd4_env`, `check`
    (RFdiffusion 3, ProteinMPNN and [dl_binder_design](https://github.com/nrbennet/dl_binder_design); needs PyRosetta and the public AF2 `params_model_1_ptm` weights). The pipeline script itself needs only `pip install numpy biopython`. Optional extra steps: `rfd4_env` (RFD4-Proteina, see below), `reglyco`.
 2. Edit `settings.py` (target file, residues, hotspots, tool paths), or use `settings_big_gpu.py`, which is driven by environment variables.
 3. Run inside WSL/Linux: `python design_pipeline.py`
@@ -45,10 +50,10 @@ Output: `0_glyco/glyco_sites.csv` with one row per motif: `exposed`, `reglyco_ac
 - Needs `atomworks<3`: `rc-foundry 0.2.0` calls a function that atomworks 3.x removed (`install_envs.sh rfd3_env` handles this).
 - RFdiffusion 1 is still available: set `"backbone_tool": "rfdiffusion"` (or `BACKBONE_TOOL=rfdiffusion`) and give it `rfdiffusion_cmd`/`rfdiffusion_workers`.
 
-## Optional: RFD4-Proteina instead of RFD3 (`backbone_tool: "rfd4"`)
+## RFD4-Proteina (the default backbone tool, `backbone_tool: "rfd4"`)
 [RFD4-Proteina](https://huggingface.co/nvidia/RFD4-Proteina) (IPD + NVIDIA, announced 2026-10-21) designs the binder's **sequence and all-atom structure together**, so the ProteinMPNN stage is skipped: `2_mpnn/sequences.csv` is filled with RFD4's own sequences (jobs are named `design_N_native`). Set `"rfd4_mpnn": True` (`RFD4_MPNN=1`) to redesign them with ProteinMPNN anyway.
 - **Install:** `bash install_envs.sh rfd4_env` (after `rfd3_env`). It needs a **CUDA 13 driver** (`nvidia-smi` shows "CUDA Version: 13.x") and Python 3.12. It is a small overlay on `rfd3_env` (re-uses its PyTorch, about 0.7 GB extra) because RFD4 needs atomworks 3.0.4+ while RFD3 needs atomworks below 3. The weights (1.7 GB) come from Hugging Face; download them on a machine with internet.
-- **Run:** `BACKBONE_TOOL=rfd4 python design_pipeline.py --settings settings_big_gpu.py ...` (settings: `rfd4_cmd` / `rfd4_workers`, `rfd4_ckpt`, `rfd4_batch_size`, `rfd4_overrides`, `rfd4_seed`; pin the exact model with `rfd4_overrides: ["hf_ckpt_revision=<commit>"]`).
+- **Run:** `python design_pipeline.py --settings settings_big_gpu.py ...` (RFD4 is picked automatically on Ampere or newer cards; `BACKBONE_TOOL=rfd3` selects the older route; settings: `rfd4_cmd` / `rfd4_workers`, `rfd4_ckpt`, `rfd4_batch_size`, `rfd4_overrides`, `rfd4_seed`; pin the exact model with `rfd4_overrides: ["hf_ckpt_revision=<commit>"]`).
 - **What the pipeline does for you:** RFD4 only reads CIF and will not bond across a gap in the target, so the pipeline writes `1_rfd4_raw/target.cif` with **every piece of `target_range` as its own chain** (`A16-108,A113-151` becomes chains A and B, original residue numbers kept), writes `spec.yaml` (contig, target backbone + sequence, hotspots), then converts each result to the usual `design_N.pdb` (target = chain A with the original numbers, binder = chain B). Each worker gets its own `seed` (RFD4's default seed is fixed, so two workers would repeat each other).
 - **`target_range` must be kept pieces only** (`A16-108,A113-151`); a bare number that designs new residues in a gap (`A16-108,4,A113-151`) is not supported with RFD4, and every residue in the range must exist in the PDB file.
 - The first run compiles the model (about 4 minutes for batch 8); later runs reuse the cache. `cuEquivariance` kernels are not installed, which RFD4 only warns about.

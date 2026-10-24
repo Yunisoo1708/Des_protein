@@ -38,6 +38,8 @@ export NUM_BACKBONES=4                                         # a small trial f
 export SEQS_PER_BACKBONE=2
 export AF2_WORKERS=8                                           # workers on the GPU: roughly one per CPU core you asked for
 export RFD_WORKERS=2
+# Backbones: RFD4-Proteina is the default (needs: bash install_envs.sh rfd4_env). For RFD3 + ProteinMPNN use: export BACKBONE_TOOL=rfd3
+export RFD4_BATCH=8                                          # designs RFD4 makes at once; use NUM_BACKBONES as a multiple of it for real runs
 export RFD3_BATCH=4                                         # designs RFD3 makes at once (more GPU memory = bigger batch)
 export RFD3_CKPT=$BASE/checkpoints/rfd3_latest.ckpt           # the RFD3 weights that install_envs.sh rfd3_env downloaded
 

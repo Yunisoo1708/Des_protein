@@ -1,6 +1,7 @@
 """Settings for ONE GPU (a laptop card, a cluster GPU, an L40S, an H200 ...), running several worker processes on it.
-Backbones come from RFdiffusion 3 (RFD3); BACKBONE_TOOL=rfd4 uses RFD4-Proteina instead (it also designs the sequence, so
-ProteinMPNN is skipped); RFdiffusion 1 is still available with BACKBONE_TOOL=rfdiffusion.
+Backbones come from RFD4-Proteina by default (it designs the sequence too, so ProteinMPNN is skipped). BACKBONE_TOOL=rfd3 uses
+RFdiffusion 3 + ProteinMPNN instead, BACKBONE_TOOL=rfdiffusion the older RFdiffusion 1. On a card older than Ampere (compute
+capability below 8.0, e.g. the GTX 1660 SUPER) the default falls back to RFD3, because RFD4 cannot run there.
 
 Everything is set with environment variables, so the same file runs any target on any machine:
 
@@ -22,6 +23,7 @@ Expected layout (what install_envs.sh creates):
     RFD3 weights:             $RFD3_CKPT   (default ~/.foundry/checkpoints/rfd3_latest.ckpt)
 """
 import os
+import subprocess
 from pathlib import Path
 
 
@@ -42,6 +44,26 @@ WORKERS_PER_GPU = {
     "af2":         int(os.environ.get("AF2_WORKERS", 8)),
 }
 GPU = os.environ.get("GPU") or os.environ.get("CUDA_VISIBLE_DEVICES", "0")   # which card; a cluster job sets it for you
+
+
+def pick_default_tool(compute_capability):
+    """RFD4-Proteina is the default backbone tool. Its attention needs bf16, which cards older than Ampere (compute capability
+    below 8.0, e.g. the GTX 1660 SUPER = 7.5) do not have: RFD4 fails there with 'Invalid backend', so those cards default to RFD3."""
+    if compute_capability is not None and compute_capability < 8.0:
+        print(f"  note: GPU {GPU} has compute capability {compute_capability} (older than Ampere): using RFD3 instead of RFD4 "
+              f"(set BACKBONE_TOOL=rfd4 to force RFD4)")
+        return "rfd3"
+    return "rfd4"
+
+
+def gpu_compute_capability():
+    """Compute capability of the chosen card, e.g. 7.5; None when nvidia-smi cannot tell (then the default stays RFD4)."""
+    try:
+        out = subprocess.run(["nvidia-smi", "-i", GPU.split(",")[0], "--query-gpu=compute_cap", "--format=csv,noheader"],
+                             capture_output=True, text=True, timeout=15).stdout.strip().splitlines()
+        return float(out[0])
+    except Exception:
+        return None
 
 HOME = Path.home()
 ENVS = Path(os.environ.get("ENVS_DIR", HOME / "miniconda3/envs"))
@@ -68,7 +90,7 @@ def workers(program, script, n, extra_env=None):
 
 
 SETTINGS = {
-    "backbone_tool": os.environ.get("BACKBONE_TOOL", "rfd3"),
+    "backbone_tool": os.environ.get("BACKBONE_TOOL") or pick_default_tool(gpu_compute_capability()),   # rfd4 (default) | rfd3 | rfdiffusion
     "target_pdb": need("TARGET_PDB"),
     "target_range": need("TARGET_RANGE"),
     "hotspots": need("HOTSPOTS"),

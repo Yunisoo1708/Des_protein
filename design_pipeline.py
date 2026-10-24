@@ -404,8 +404,10 @@ def step1_rfd3(S, out):
 
 
 def backbone_tool(S):
-    return S.get("backbone_tool") or ("rfd3" if (S.get("rfd3_workers") or S.get("rfd3_cmd")) else
-                                      "rfd4" if (S.get("rfd4_workers") or S.get("rfd4_cmd")) else "rfdiffusion")
+    """Which tool makes the backbones: the setting "backbone_tool", else the first tool the settings give a command for
+    (RFD4, then RFD3, then RFdiffusion 1)."""
+    return S.get("backbone_tool") or ("rfd4" if (S.get("rfd4_workers") or S.get("rfd4_cmd")) else
+                                      "rfd3" if (S.get("rfd3_workers") or S.get("rfd3_cmd")) else "rfdiffusion")
 
 
 # ---- RFD4-Proteina: designs the binder's SEQUENCE and structure together, so ProteinMPNN is not needed ---------------

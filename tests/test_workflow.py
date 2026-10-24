@@ -335,5 +335,14 @@ try:
 finally:
     for k, v in saved.items():
         os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+# RFD4 is the default tool; cards older than Ampere (compute capability < 8) fall back to RFD3
+os.environ["TARGET_PDB"], os.environ["TARGET_RANGE"], os.environ["HOTSPOTS"] = "t.pdb", "A1-10", "A5"
+os.environ.pop("BACKBONE_TOOL", None)
+ns12 = runpy.run_path(str(HERE.parent / "settings_big_gpu.py"))
+assert ns12["pick_default_tool"](None) == "rfd4" and ns12["pick_default_tool"](8.9) == "rfd4" and ns12["pick_default_tool"](12.0) == "rfd4"
+assert ns12["pick_default_tool"](7.5) == "rfd3", "GTX 1660 SUPER (7.5) cannot run RFD4"
+from design_pipeline import backbone_tool                                     # noqa: E402
+assert backbone_tool({"rfd4_cmd": ["x"], "rfd3_cmd": ["y"]}) == "rfd4" and backbone_tool({"rfd3_cmd": ["y"]}) == "rfd3"
+assert backbone_tool({"backbone_tool": "rfd3", "rfd4_cmd": ["x"]}) == "rfd3", "an explicit setting always wins"
 print("Test 12 passed: dual-GPU settings (RFD4 on the big card only, RFD3 on both, AF2 environment per card, 12:1 / 4:1 shares)")
 print("\nALL TESTS PASSED")
