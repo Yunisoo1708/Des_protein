@@ -47,13 +47,13 @@ from pathlib import Path
 # 1. YOUR JOB: edit these (or set the environment variable of the same name, which wins)
 # =====================================================================================================================
 JOB = {
-    "TARGET_PDB": "",              # full path of the PDB file of the protein you want to bind, e.g. /home/me/targets/5YXH.pdb
-    "TARGET_RANGE": "",            # chain letter + residues to keep; separate pieces with COMMAS, e.g. A16-108,A113-151
-    "HOTSPOTS": "",                # 2-4 target residues (same numbering) the binder should touch, e.g. A31,A32
-    "BINDER_LENGTH": "55-55",      # "55-55" = fixed length; "60-80" = the tool picks a length in that range
-    "NUM_BACKBONES": "8",          # how many designs; a multiple of 8 suits RFD4's batch size
+    "TARGET_PDB": "/mnt/c/Research/protein_design_workflow/prepared_protein_structure/spiky.pdb",              # full path of the PDB file of the protein you want to bind, e.g. /home/me/targets/5YXH.pdb
+    "TARGET_RANGE": "A1-9,A280-309",            # chain letter + residues to keep; separate pieces with COMMAS, e.g. A16-108,A113-151
+    "HOTSPOTS": "A1,A2,A6,A9,A280,A285,A288,A291,A294,A301,A308,A309",                # 2-4 target residues (same numbering) the binder should touch, e.g. A31,A32
+    "BINDER_LENGTH": "70-70",      # "55-55" = fixed length; "60-80" = the tool picks a length in that range
+    "NUM_BACKBONES": "20",          # how many designs; a multiple of 8 suits RFD4's batch size
     "SEQS_PER_BACKBONE": "4",      # ProteinMPNN sequences per backbone (only used with RFD3, or RFD4 with RFD4_MPNN=1)
-    "GPUS": "",                    # which card(s), numbers from nvidia-smi: "0", "1" or "0,1". Empty = CUDA_VISIBLE_DEVICES, else 0
+    "GPUS": "0",                    # which card(s), numbers from nvidia-smi: "0", "1" or "0,1". Empty = CUDA_VISIBLE_DEVICES, else 0
 }
 
 # =====================================================================================================================
