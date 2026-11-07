@@ -1,2 +1,5 @@
 __pycache__/
 tests/_work/
+work/
+hydra_outputs/
+runs/

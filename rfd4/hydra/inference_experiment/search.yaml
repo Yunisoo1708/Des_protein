@@ -1,0 +1,28 @@
+# @package _global_
+# Reward-guided beam search for RFD4. Used by `./setup.sh run-rfd4 --search` (see rfd4/README.md).
+# Partly denoised designs (after step 30 and step 60 of 60) are folded by an AF3 oracle and scored; only the best candidates continue.
+# The reward here is the pLDDT of the designed chain. To optimise the interface instead, use
+#   oracle_ppi.min_ipae_coi: {weight: -1.0}     (interface error, lower is better)
+defaults:
+  - inference_on_user_inputs
+  - _self_
+
+metrics_tags: [design, ppi_refolding]
+
+search:
+  n_branch: 2          # candidates grown from each kept design
+  beam_width: 2        # designs kept after each scoring step
+  save_rollouts: true
+  checkpoints:
+    "30":
+      metrics: [oracle_ppi]
+      rewards:
+        oracle_ppi.plddt_coi:
+          weight: 1.0
+          clip: {min: 50.0}
+    "60":
+      metrics: [oracle_ppi]
+      rewards:
+        oracle_ppi.plddt_coi:
+          weight: 1.0
+          clip: {min: 50.0}

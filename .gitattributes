@@ -1,2 +1,0 @@
-# Shell scripts must keep Unix line endings: bash on Linux/Slurm fails on CRLF ("$'': command not found")
-*.sh text eol=lf
